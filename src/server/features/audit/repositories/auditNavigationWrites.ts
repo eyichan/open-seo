@@ -25,20 +25,22 @@ export async function savePageDepths(
     groups.map((group) => {
       const values = sql.join(
         group.map(
-          ({ id, crawlDepth }) => sql`SELECT CAST(${id} AS TEXT) AS page_id,
-                                              CAST(${crawlDepth} AS INTEGER) AS depth`,
+          ({ id, crawlDepth }) =>
+            sql`(CAST(${id} AS TEXT), CAST(${crawlDepth} AS INTEGER))`,
         ),
-        sql` UNION ALL `,
+        sql`, `,
       );
       return tx
         .update(auditPages)
-        .set({ crawlDepth: sql`navigation_updates.depth` })
-        .from(sql`(${values}) AS navigation_updates`)
+        .set({ crawlDepth: sql`navigation_updates.column2` })
+        .from(sql`(VALUES ${values}) AS navigation_updates`)
         .where(
           and(
-            eq(auditPages.auditId, auditId),
-            sql`${auditPages.id} = navigation_updates.page_id`,
-            sql`${auditPages.crawlDepth} IS DISTINCT FROM navigation_updates.depth`,
+            // Keep D1's join driven by the batch's primary keys rather than
+            // scanning the entire audit once for each batch.
+            sql`CAST(${auditPages.auditId} AS TEXT) = ${auditId}`,
+            sql`${auditPages.id} = navigation_updates.column1`,
+            sql`${auditPages.crawlDepth} IS DISTINCT FROM navigation_updates.column2`,
           ),
         );
     }),

@@ -19,6 +19,8 @@ it("writes 10,000 page depths in bounded statements and retries without changing
   let changed = 0;
   env.DB = {
     prepare(query: string) {
+      // D1 rejected the old compound SELECT at its native statement limit.
+      expect(query).not.toMatch(/\bUNION\b/i);
       return {
         bind(...params: SQLInputValue[]) {
           expect(params.length).toBeLessThanOrEqual(100);
