@@ -99,14 +99,20 @@ export class SiteAuditWorkflow extends WorkflowEntrypoint<Env, AuditParams> {
         "resolve-start-url",
         START_URL_STEP,
         () =>
-          resolveAuditStart({
-            auditId,
-            organizationId: billingCustomer.organizationId,
-            projectId,
-            startUrl: event.payload.startUrl,
-            config: event.payload.config,
-            access: event.payload.access,
-          }),
+          event.payload.config.continuationFrom
+            ? Promise.resolve({
+                startUrl: event.payload.startUrl,
+                config: event.payload.config,
+                access: event.payload.access,
+              })
+            : resolveAuditStart({
+                auditId,
+                organizationId: billingCustomer.organizationId,
+                projectId,
+                startUrl: event.payload.startUrl,
+                config: event.payload.config,
+                access: event.payload.access,
+              }),
       );
 
       await runAuditPhases(step, {

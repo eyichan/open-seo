@@ -48,6 +48,7 @@ export const SCRATCHPAD_SCHEMA_SQL = `
     redirect_url TEXT
   );
   CREATE INDEX IF NOT EXISTS page_mirror_redirect_idx ON page_mirror (redirect_url);
+  CREATE TABLE IF NOT EXISTS coverage_flags (name TEXT PRIMARY KEY) WITHOUT ROWID;
 `;
 
 /**

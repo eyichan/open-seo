@@ -89,6 +89,7 @@ async function startAudit(input: {
     lighthouseStrategy,
     renderJavaScript,
     crawlerCredentialId: credential?.id,
+    coverageVersion: 2,
   };
 
   await AuditRepository.createAudit({

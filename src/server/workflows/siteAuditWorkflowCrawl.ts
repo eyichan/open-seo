@@ -72,6 +72,7 @@ type CrawlPhaseParams = {
   robots: RobotsResult;
   /** Frontier size after discovery seeding (from the discover-urls step). */
   seededCount: number;
+  previouslyVisited?: number;
   renderJavaScript?: boolean;
   sitePlatform?: AuditConfig["sitePlatform"];
   /**
@@ -324,6 +325,7 @@ async function runCrawlChunk(
           pages,
           depthByUrl,
           maxPages,
+          previouslyVisited: input.previouslyVisited,
         }),
       )
       .finally(() => {

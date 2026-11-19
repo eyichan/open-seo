@@ -43,4 +43,21 @@ describe("discoverUrls crawler access", () => {
     );
     expect(signatureSentTo("https://cdn.other.test/robots.txt")).toBeNull();
   });
+
+  it("reports unseen sitemap URLs when the discovery budget cuts a valid sitemap", async () => {
+    const urls = Array.from(
+      { length: 501 },
+      (_, i) => `<url><loc>https://store.example.com/${i}</loc></url>`,
+    );
+    vi.mocked(fetch).mockImplementation((input) =>
+      Promise.resolve(
+        input === "https://store.example.com/sitemap.xml"
+          ? new Response(`<urlset>${urls.join("")}</urlset>`)
+          : new Response(null, { status: 404 }),
+      ),
+    );
+    const result = await discoverUrls("https://store.example.com", 10);
+    expect(result.urls).toHaveLength(500);
+    expect(result.coverage).toEqual(["sitemap-url-limit"]);
+  });
 });

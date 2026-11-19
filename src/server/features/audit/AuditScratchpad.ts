@@ -20,6 +20,7 @@
  */
 import { DurableObject, env } from "cloudflare:workers";
 import type { CrawlThrottleState } from "@/server/lib/audit/crawl-throttle";
+import { readVisitedUrls, restoreCheckpoint } from "./scratchpad-checkpoint";
 import {
   BROKEN_LINKS_SQL,
   FRONTIER_CLAIM_SQL,
@@ -81,6 +82,7 @@ interface RecordBatchInput {
   links: ScratchpadPageLinksRow[];
   /** Newly discovered same-origin URLs to enqueue (already policy-filtered). */
   discovered: Array<{ url: string; depth: number | null }>;
+  discoveryLimited?: boolean;
 }
 
 interface BrokenLinkRow {
@@ -88,11 +90,13 @@ interface BrokenLinkRow {
   sourceUrl: string;
   targetUrl: string;
   targetStatus: number;
+  previous?: true;
 }
 
 interface OrphanPageRow {
   pageId: string;
   url: string;
+  previous?: true;
 }
 
 const BROKEN_LINK_ISSUE_CAP = 2_000;
@@ -197,6 +201,11 @@ export class AuditScratchpad extends DurableObject {
   }
 
   private storeBatch(input: RecordBatchInput): FrontierStats {
+    if (input.discoveryLimited) {
+      this.ctx.storage.sql.exec(
+        "INSERT OR IGNORE INTO coverage_flags VALUES ('link-discovery-limited')",
+      );
+    }
     for (const url of input.crawledUrls) {
       this.ctx.storage.sql.exec(
         `UPDATE frontier SET state = 'crawled' WHERE url = ?`,
@@ -278,6 +287,32 @@ export class AuditScratchpad extends DurableObject {
     return this.stats();
   }
 
+  async getCoverage() {
+    const sql = this.ctx.storage.sql;
+    const stats = sql
+      .exec<{ visited: number; unread: number; incomplete: number }>(
+        `SELECT COUNT(*) AS visited,
+              COUNT(*) FILTER (WHERE m.fetch_class != 'ok') AS unread,
+              COUNT(*) FILTER (WHERE json_type(p.targets_json, '$[#-1]') IS NOT 'true') AS incomplete
+       FROM page_mirror m LEFT JOIN page_links p ON p.page_id = m.page_id`,
+      )
+      .one();
+    return {
+      ...this.stats(),
+      ...stats,
+      discoveryLimited:
+        sql.exec("SELECT 1 FROM coverage_flags LIMIT 1").toArray().length > 0,
+    };
+  }
+
+  async readVisitedUrls(afterUrl: string) {
+    return readVisitedUrls(this.ctx.storage.sql, afterUrl);
+  }
+
+  async restoreCheckpoint(input: Parameters<typeof restoreCheckpoint>[1]) {
+    restoreCheckpoint(this.ctx.storage, input);
+  }
+
   /**
    * The two finalize checks that need link edges, as local SQL. Mirrors the
    * former Postgres implementations in multipage.ts exactly.
@@ -285,11 +320,19 @@ export class AuditScratchpad extends DurableObject {
   async runFinalizeChecks(input: {
     startUrl: string;
     crawlCompleted: boolean;
+    hasPriorPages?: boolean;
   }): Promise<{ brokenLinks: BrokenLinkRow[]; orphanPages: OrphanPageRow[] }> {
     // Only flag targets we actually crawled and saw fail — never inferred
     // from absence. Blocked targets (WAF challenges) are excluded: a 403
     // from bot protection is not evidence of a broken link.
-    const brokenLinks = this.ctx.storage.sql
+    const sql = this.ctx.storage.sql;
+    const previous = (url: string) =>
+      sql
+        .exec("SELECT 1 FROM frontier WHERE url = ? AND state = 'prior'", url)
+        .toArray().length
+        ? { previous: true as const }
+        : {};
+    const brokenLinks = sql
       .exec<{
         source_page_id: string;
         source_url: string;
@@ -302,13 +345,13 @@ export class AuditScratchpad extends DurableObject {
         sourceUrl: row.source_url,
         targetUrl: row.target_url,
         targetStatus: row.target_status,
+        ...(input.hasPriorPages ? previous(row.source_url) : {}),
       }));
 
     // A live 2xx page is an orphan when no OTHER crawled page links to it
     // and nothing redirects to it. Only meaningful on a completed crawl with
     // a complete link graph — if the storage budget truncated link writes,
     // "no inbound edge" is missing data, not evidence of orphanhood.
-    const sql = this.ctx.storage.sql;
     const linkGraphComplete =
       input.crawlCompleted &&
       sql.databaseSize < LINK_STORAGE_BUDGET_BYTES &&
@@ -321,7 +364,11 @@ export class AuditScratchpad extends DurableObject {
             url: string;
           }>(ORPHAN_PAGES_SQL, input.startUrl)
           .toArray()
-          .map((row) => ({ pageId: row.page_id, url: row.url }))
+          .map((row) => ({
+            pageId: row.page_id,
+            url: row.url,
+            ...(input.hasPriorPages ? previous(row.url) : {}),
+          }))
       : [];
 
     return { brokenLinks, orphanPages };

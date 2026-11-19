@@ -38,7 +38,8 @@ retries). All transient crawl state lives in `AuditScratchpad`, a SQLite-backed
 Durable Object, one instance per audit (`idFromName(auditId)`):
 
 - **frontier** — URL queue and dedup set (URL primary key), with
-  `pending / leased / crawled` states keyed by chunk number;
+  `pending / leased / crawled` states keyed by chunk number, plus `prior` for
+  URLs already attempted by an earlier segment;
 - **page_links** — each source page's normalized internal targets in one
   idempotent write, with a flag for incomplete link capture;
 - **page_mirror** — the few columns the finalize link checks need.
@@ -52,6 +53,23 @@ the DO at finalize.
 Rejected alternatives: Cloudflare Queues (no dedup, no counters, no completion
 signal — a frontier is mostly those things), a Postgres frontier table (chatty
 hot-path writes, dual-dialect surface), R2 spill files (not queryable).
+
+### Continuing capped audits
+
+A capped segment saves its waiting URLs, visited page observations and
+available link targets in the audit's existing private R2 prefix. The
+coverage manifest is written after the parts and published when the audit
+completes. A successor restores that snapshot into a fresh Durable Object,
+keeps its own page budget and page rows, and processes the waiting queue
+without seeding the sitemap again. Newly found links enter the same queue.
+Link checks use the cumulative scratchpad. Ordinary page and multipage
+reports describe the current segment.
+
+Older capped audits can supply their archived waiting URLs and persisted
+visited pages. Their historical link targets and discovery coverage are
+unknown. Full coverage requires an exhausted queue, readable observations,
+complete link capture and no recorded discovery gaps. A failed or truncated
+discovery prevents the service from treating an empty queue as full coverage.
 
 ### Chunked rolling crawl
 

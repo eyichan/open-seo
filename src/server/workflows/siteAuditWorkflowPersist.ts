@@ -8,6 +8,7 @@ import {
 } from "@/server/lib/audit/url-utils";
 import { isCrawlableUrl } from "@/server/lib/audit/url-policy";
 import { deterministicAuditRowId } from "@/server/lib/audit/ids";
+import { FRONTIER_PART_ROWS } from "@/server/lib/audit/frontier-checkpoint";
 import {
   runPageReporters,
   type DetectedIssue,
@@ -34,8 +35,6 @@ const SCRATCHPAD_BATCH_BYTES = 24 * 1024 * 1024;
  */
 const MAX_DISCOVERED_PER_BATCH = 20_000;
 const MAX_PROGRESS_TITLE_CHARS = 300;
-/** Keep each scratchpad read and R2 write bounded independently of crawl size. */
-const FRONTIER_EXPORT_BATCH = 500;
 
 function shouldQueueCrawlLink(
   link: string,
@@ -137,6 +136,7 @@ export async function persistCrawledPages(input: {
   pages: CrawledPageResult[];
   depthByUrl: Map<string, number | null>;
   maxPages: number;
+  previouslyVisited?: number;
 }): Promise<FrontierStats> {
   const {
     auditId,
@@ -156,21 +156,23 @@ export async function persistCrawledPages(input: {
   await AuditRepository.insertCrawledBatch(auditId, pages, issues);
 
   const seen = new Set<string>();
+  let discoveryLimited = false;
   const sources = pages.map((page) => {
     const discovered: ScratchpadBatch["discovered"] = [];
     const pageDepth = depthByUrl.get(page.url) ?? null;
     const childDepth = pageDepth === null ? null : pageDepth + 1;
 
     for (const link of page.links) {
-      if (!link.isInternal) continue;
-      if (
-        seen.size < MAX_DISCOVERED_PER_BATCH &&
-        !seen.has(link.targetUrl) &&
-        shouldQueueCrawlLink(link.targetUrl, origin, robots, sitePlatform)
-      ) {
-        seen.add(link.targetUrl);
-        discovered.push({ url: link.targetUrl, depth: childDepth });
+      if (!link.isInternal || seen.has(link.targetUrl)) continue;
+      if (discoveryLimited) break;
+      if (!shouldQueueCrawlLink(link.targetUrl, origin, robots, sitePlatform))
+        continue;
+      if (seen.size >= MAX_DISCOVERED_PER_BATCH) {
+        discoveryLimited = true;
+        continue;
       }
+      seen.add(link.targetUrl);
+      discovered.push({ url: link.targetUrl, depth: childDepth });
     }
     // Redirect targets continue the same navigation path: same depth.
     if (
@@ -185,6 +187,7 @@ export async function persistCrawledPages(input: {
   });
 
   const [firstBatch, ...remainingBatches] = scratchpadBatches(sources);
+  if (discoveryLimited) firstBatch.discoveryLimited = true;
   let stats = await scratchpad.recordBatch(firstBatch);
   for (const batch of remainingBatches) {
     stats = await scratchpad.recordBatch(batch);
@@ -192,7 +195,10 @@ export async function persistCrawledPages(input: {
 
   await AuditRepository.updateAuditProgress(auditId, input.workflowInstanceId, {
     pagesCrawled: stats.attempted,
-    pagesTotal: Math.min(stats.seen, input.maxPages),
+    pagesTotal: Math.min(
+      stats.seen - (input.previouslyVisited ?? 0),
+      input.maxPages,
+    ),
   });
   await AuditProgressKV.pushCrawledUrls(
     auditId,
@@ -219,10 +225,7 @@ async function exportCappedFrontier(
   let frontierParts = 0;
   let exported = 0;
   for (;;) {
-    const rows = await scratchpad.readPendingUrls(
-      afterUrl,
-      FRONTIER_EXPORT_BATCH,
-    );
+    const rows = await scratchpad.readPendingUrls(afterUrl, FRONTIER_PART_ROWS);
     const last = rows.at(-1);
     if (!last) break;
     exported += rows.length;
@@ -232,7 +235,7 @@ async function exportCappedFrontier(
       `${frontierPrefix}${frontierParts}.json`,
       JSON.stringify(rows),
     );
-    if (rows.length < FRONTIER_EXPORT_BATCH) break;
+    if (rows.length < FRONTIER_PART_ROWS) break;
     afterUrl = last.url;
   }
   if (exported !== expectedCount) {
@@ -249,6 +252,7 @@ export async function collectScratchpadIssues(
   projectId: string,
   startUrl: string,
   crawl: CrawlPhaseResult,
+  checkpoint?: { saved: true; hasPriorPages: boolean },
 ): Promise<DetectedIssue[]> {
   const scratchpad = getAuditScratchpad(auditId);
   const { brokenLinks, orphanPages } = await scratchpad.runFinalizeChecks({
@@ -257,19 +261,20 @@ export async function collectScratchpadIssues(
     startUrl: normalizeUrl(startUrl) ?? startUrl,
     // Orphan detection only makes sense when the crawl wasn't truncated.
     crawlCompleted: crawl.completed,
+    ...(checkpoint?.hasPriorPages ? { hasPriorPages: true } : {}),
   });
 
   const issues: DetectedIssue[] = [
     ...brokenLinks.map((row) => ({
       issueType: "broken-internal-link" as const,
-      pageId: row.sourcePageId,
+      pageId: row.previous ? null : row.sourcePageId,
       pageUrl: row.sourceUrl,
       dedupeKey: row.targetUrl,
       details: { targetUrl: row.targetUrl, targetStatus: row.targetStatus },
     })),
     ...orphanPages.map((row) => ({
       issueType: "orphan-page" as const,
-      pageId: row.pageId,
+      pageId: row.previous ? null : row.pageId,
       pageUrl: row.url,
     })),
   ];
@@ -278,7 +283,12 @@ export async function collectScratchpadIssues(
     const urlsNotCrawled = details?.urlsNotCrawled;
     const frontier =
       issueType === "crawl-page-limit" && urlsNotCrawled
-        ? await exportCappedFrontier(projectId, auditId, urlsNotCrawled)
+        ? checkpoint
+          ? {
+              frontierPrefix: `site-audit/${projectId}/${auditId}/frontier/v1/`,
+              frontierParts: Math.ceil(urlsNotCrawled / FRONTIER_PART_ROWS),
+            }
+          : await exportCappedFrontier(projectId, auditId, urlsNotCrawled)
         : undefined;
     issues.push({
       issueType,

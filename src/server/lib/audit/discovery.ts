@@ -2,8 +2,9 @@
  * robots.txt and sitemap.xml discovery for the site audit crawler.
  */
 import robotsParser from "robots-parser";
-import { XMLParser } from "fast-xml-parser";
-import { readBodyCapped } from "./html-response";
+import { XMLParser, XMLValidator } from "fast-xml-parser";
+import { sort } from "remeda";
+import { readBodyCapped, readTextPrefix } from "./html-response";
 import { isSameOrigin, normalizeUrl } from "./url-utils";
 import { isCrawlableUrl } from "./url-policy";
 import { publicFetch } from "@/server/lib/public-fetch";
@@ -45,11 +46,11 @@ export interface RobotsResult {
  * from parsing so Workflows can checkpoint the text as durable step state and
  * re-derive the parsed result deterministically on replay.
  */
-async function fetchRobotsTxtText(
+async function fetchRobotsTxt(
   origin: string,
   access: CrawlerAccess | null | undefined,
   waitForRateLimit: RateLimitWait,
-): Promise<string | null> {
+) {
   try {
     const fetchRobots = () =>
       fetchFollowingRedirects(`${origin}/robots.txt`, 10_000, access);
@@ -60,12 +61,31 @@ async function fetchRobotsTxtText(
     ) {
       fetched = await fetchRobots();
     }
-    if (!fetched?.response.ok) return null;
-    return (await fetched.response.text()).slice(0, MAX_ROBOTS_TXT_BYTES);
+    if (!fetched?.response.ok) {
+      const status = fetched?.response.status;
+      await fetched?.response.body?.cancel();
+      return {
+        robotsText: null,
+        robotsCoverage:
+          status === 404 || status === 410 ? "absent" : "unavailable",
+      } as const;
+    }
+    const { text, capped } = await readTextPrefix(
+      fetched.response,
+      MAX_ROBOTS_TXT_BYTES,
+    );
+    return {
+      robotsText: text,
+      robotsCoverage: capped ? "truncated" : "read",
+    } as const;
   } catch (error) {
     console.warn("Failed to fetch robots.txt:", error);
-    return null;
+    return { robotsText: null, robotsCoverage: "unavailable" } as const;
   }
+}
+
+export function readAuditRobots(origin: string, access?: CrawlerAccess | null) {
+  return fetchRobotsTxt(origin, access, createRateLimitWait());
 }
 
 const MAX_DISCOVERY_REDIRECT_HOPS = 5;
@@ -197,10 +217,16 @@ async function fetchSitemapDocumentWithRetry(
   nestedSitemaps: string[];
   pageUrls: string[];
   timedOut: boolean;
+  state: "read" | "absent" | "unavailable" | "truncated";
 }> {
   const normalizedSitemapUrl = normalizeUrl(sitemapUrl);
   if (!normalizedSitemapUrl) {
-    return { nestedSitemaps: [], pageUrls: [], timedOut: false };
+    return {
+      nestedSitemaps: [],
+      pageUrls: [],
+      timedOut: false,
+      state: "unavailable",
+    };
   }
 
   let lastError: unknown = null;
@@ -213,13 +239,24 @@ async function fetchSitemapDocumentWithRetry(
         access,
       );
       if (!fetched) {
-        return { nestedSitemaps: [], pageUrls: [], timedOut: false };
+        return {
+          nestedSitemaps: [],
+          pageUrls: [],
+          timedOut: false,
+          state: "unavailable",
+        };
       }
       const { response } = fetched;
 
       const finalUrl = normalizeUrl(fetched.finalUrl, normalizedSitemapUrl);
       if (!finalUrl || !isSameOrigin(finalUrl, normalizedSitemapUrl)) {
-        return { nestedSitemaps: [], pageUrls: [], timedOut: false };
+        await response.body?.cancel();
+        return {
+          nestedSitemaps: [],
+          pageUrls: [],
+          timedOut: false,
+          state: "unavailable",
+        };
       }
 
       if (
@@ -230,15 +267,30 @@ async function fetchSitemapDocumentWithRetry(
         continue;
       }
       if (!response.ok) {
-        return { nestedSitemaps: [], pageUrls: [], timedOut: false };
+        await response.body?.cancel();
+        return {
+          nestedSitemaps: [],
+          pageUrls: [],
+          timedOut: false,
+          state:
+            response.status === 404 || response.status === 410
+              ? "absent"
+              : "unavailable",
+        };
       }
 
       const body = await readBodyCapped(response, MAX_SITEMAP_BYTES);
       if (
         body === null ||
-        !isProbablySitemapXml(response.headers.get("content-type"), body)
+        !isProbablySitemapXml(response.headers.get("content-type"), body) ||
+        XMLValidator.validate(body) !== true
       ) {
-        return { nestedSitemaps: [], pageUrls: [], timedOut: false };
+        return {
+          nestedSitemaps: [],
+          pageUrls: [],
+          timedOut: false,
+          state: body === null ? "truncated" : "unavailable",
+        };
       }
 
       const parsed = xmlParser.parse(body) as unknown;
@@ -250,7 +302,17 @@ async function fetchSitemapDocumentWithRetry(
         .map((loc) => normalizeUrl(loc, finalUrl))
         .filter((loc): loc is string => loc !== null);
 
-      return { nestedSitemaps, pageUrls, timedOut: false };
+      return {
+        nestedSitemaps,
+        pageUrls,
+        timedOut: false,
+        state:
+          sections.sitemap === undefined &&
+          sections.url === undefined &&
+          !/<(?:urlset|sitemapindex)\b/i.test(body)
+            ? "unavailable"
+            : "read",
+      };
     } catch (error) {
       lastError = error;
       if (!isTimeoutError(error) || attempt === SITEMAP_RETRIES) {
@@ -263,6 +325,7 @@ async function fetchSitemapDocumentWithRetry(
     nestedSitemaps: [],
     pageUrls: [],
     timedOut: isTimeoutError(lastError),
+    state: "unavailable",
   };
 }
 
@@ -274,9 +337,13 @@ export async function discoverUrls(
   origin: string,
   maxPages = 50,
   access?: CrawlerAccess | null,
-): Promise<{ urls: string[]; robotsText: string | null }> {
+) {
   const waitForRateLimit = createRateLimitWait();
-  const robotsText = await fetchRobotsTxtText(origin, access, waitForRateLimit);
+  const { robotsText, robotsCoverage } = await fetchRobotsTxt(
+    origin,
+    access,
+    waitForRateLimit,
+  );
   const robots = parseRobotsTxt(origin, robotsText);
 
   // Collect sitemap URLs: from robots.txt + default location
@@ -285,6 +352,16 @@ export async function discoverUrls(
 
   const maxDiscoveredUrls = Math.min(Math.max(maxPages * 20, 500), 50_000);
   const allUrls = new Set<string>();
+  const coverage = new Set<string>();
+  if (robotsCoverage === "unavailable" || robotsCoverage === "truncated") {
+    coverage.add(`robots-${robotsCoverage}`);
+  }
+  const declared = new Set(
+    robots.sitemapUrls.map((url) => normalizeUrl(url, origin)),
+  );
+  if ([...declared].some((url) => !url || !isSameOrigin(url, origin))) {
+    coverage.add("sitemap-outside-origin");
+  }
 
   const queue: Array<{ url: string; depth: number }> = Array.from(
     sitemapSources,
@@ -299,10 +376,11 @@ export async function discoverUrls(
   let timedOutDocs = 0;
 
   while (queue.length > 0 && allUrls.size < maxDiscoveredUrls) {
-    if (fetchedDocs >= MAX_SITEMAP_DOCS) {
-      break;
-    }
-    const batch = queue.splice(0, SITEMAP_CONCURRENCY);
+    if (fetchedDocs >= MAX_SITEMAP_DOCS) break;
+    const batch = queue.splice(
+      0,
+      Math.min(SITEMAP_CONCURRENCY, MAX_SITEMAP_DOCS - fetchedDocs),
+    );
     await Promise.all(
       batch.map(async ({ url, depth }) => {
         const normalizedUrl = normalizeUrl(url);
@@ -323,10 +401,18 @@ export async function discoverUrls(
           access,
           waitForRateLimit,
         );
-        if (
-          result.pageUrls.length === 0 &&
-          result.nestedSitemaps.length === 0
-        ) {
+        if (result.state !== "read") {
+          if (
+            result.state !== "absent" ||
+            declared.has(normalizedUrl) ||
+            depth < MAX_SITEMAP_DEPTH
+          ) {
+            coverage.add(
+              result.state === "truncated"
+                ? "sitemap-byte-limit"
+                : "sitemap-unavailable",
+            );
+          }
           failedDocs += 1;
           if (result.timedOut) {
             timedOutDocs += 1;
@@ -336,20 +422,30 @@ export async function discoverUrls(
 
         for (const pageUrl of result.pageUrls) {
           if (!isSameOrigin(pageUrl, origin)) continue;
-          if (allUrls.size >= maxDiscoveredUrls) break;
+          if (allUrls.has(pageUrl)) continue;
+          if (allUrls.size >= maxDiscoveredUrls) {
+            coverage.add("sitemap-url-limit");
+            break;
+          }
           allUrls.add(pageUrl);
         }
 
-        if (depth <= 1) return;
-
         for (const nestedUrl of result.nestedSitemaps) {
-          if (!isSameOrigin(nestedUrl, origin)) continue;
+          if (!isSameOrigin(nestedUrl, origin)) {
+            coverage.add("sitemap-outside-origin");
+            continue;
+          }
           if (!seenSitemapDocs.has(nestedUrl)) {
-            queue.push({ url: nestedUrl, depth: depth - 1 });
+            if (depth <= 1) coverage.add("sitemap-depth-limit");
+            else queue.push({ url: nestedUrl, depth: depth - 1 });
           }
         }
       }),
     );
+  }
+  if (queue.some(({ url }) => !seenSitemapDocs.has(url))) {
+    if (allUrls.size >= maxDiscoveredUrls) coverage.add("sitemap-url-limit");
+    if (fetchedDocs >= MAX_SITEMAP_DOCS) coverage.add("sitemap-document-limit");
   }
 
   if (failedDocs > 0) {
@@ -368,5 +464,6 @@ export async function discoverUrls(
   return {
     urls: Array.from(allUrls),
     robotsText,
+    coverage: sort([...coverage], (a, b) => a.localeCompare(b)),
   };
 }

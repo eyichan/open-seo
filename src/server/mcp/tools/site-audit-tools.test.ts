@@ -1,3 +1,4 @@
+/* eslint-disable max-lines -- site-audit tool cases share the project and workflow fixtures. */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const {
@@ -8,6 +9,11 @@ const {
   issueGroupsMock,
   listIssuesMock,
   lighthouseResultsMock,
+  projectAccessMock,
+  projectAuditMock,
+  reserveAuditMock,
+  claimLaunchMock,
+  getWorkflowMock,
 } = vi.hoisted(() => ({
   hasPaidPlanMock: vi.fn(),
   workflowCreateMock:
@@ -20,10 +26,17 @@ const {
   issueGroupsMock: vi.fn(),
   listIssuesMock: vi.fn(),
   lighthouseResultsMock: vi.fn(),
+  projectAccessMock: vi.fn(),
+  projectAuditMock: vi.fn(),
+  reserveAuditMock: vi.fn(),
+  claimLaunchMock: vi.fn(),
+  getWorkflowMock: vi.fn(),
 }));
 
 vi.mock("cloudflare:workers", () => ({
-  env: { SITE_AUDIT_WORKFLOW: { create: workflowCreateMock } },
+  env: {
+    SITE_AUDIT_WORKFLOW: { create: workflowCreateMock, get: getWorkflowMock },
+  },
 }));
 vi.mock("@/server/lib/runtime-env", () => ({
   isHostedServerAuthMode: vi.fn().mockResolvedValue(true),
@@ -41,16 +54,22 @@ vi.mock("@/server/billing/subscription", () => ({
 }));
 vi.mock("@/server/features/projects/services/ProjectService", () => ({
   ProjectService: {
-    getProjectForOrganization: vi.fn().mockResolvedValue({ id: "project-1" }),
+    getProjectForOrganization: projectAccessMock,
   },
 }));
 vi.mock("@/server/features/audit/repositories/AuditRepository", () => ({
   AuditRepository: {
-    createAudit: vi.fn(),
+    createAudit: reserveAuditMock,
     getAuditUsageForOrganization: vi
       .fn()
       .mockResolvedValue({ runningCount: 1, capacityUnits: 0 }),
     getLatestAuditForProject: latestAuditMock,
+    getAuditForProject: projectAuditMock,
+    countRunningForProject: vi.fn().mockResolvedValue(1),
+    claimContinuationLaunch: claimLaunchMock,
+    getPageLimitIssue: vi.fn().mockResolvedValue({
+      detailsJson: '{"pagesCrawled":10,"urlsNotCrawled":2,"frontierParts":1}',
+    }),
   },
 }));
 vi.mock("@/server/features/audit/repositories/auditResultsQueries", () => ({
@@ -62,6 +81,7 @@ vi.mock("@/server/features/audit/repositories/auditResultsQueries", () => ({
 // A stored report is named by its key, so a test can tell which one was read.
 vi.mock("@/server/lib/r2", () => ({
   getJsonFromR2: async (key: string) => key,
+  getOptionalJsonFromR2: async () => null,
 }));
 vi.mock("@/server/lib/lighthousePayload", () => ({
   readStoredLighthousePayload: (report: string) => ({
@@ -97,6 +117,10 @@ import {
   runSiteAuditTool,
 } from "@/server/mcp/tools/site-audit-tools";
 import {
+  continueSiteAuditTool,
+  getAuditFrontierTool,
+} from "./site-audit-frontier-tools";
+import {
   makeToolContext,
   textContent,
 } from "@/server/mcp/tools/tool-test-support";
@@ -107,6 +131,197 @@ function runAudit(maxPages: number) {
     makeToolContext(),
   );
 }
+
+beforeEach(() => {
+  projectAccessMock.mockResolvedValue({
+    id: "project-1",
+    domain: "example.com",
+  });
+  projectAuditMock.mockResolvedValue(null);
+  reserveAuditMock.mockResolvedValue(true);
+  claimLaunchMock.mockResolvedValue(true);
+});
+
+describe("site audit frontier tools", () => {
+  const projectId = "10f6e911-00a1-427f-b48a-cf07d5dbbc23";
+  const auditId = "da9cb7ed-2835-4adf-b939-8e8802e6d374";
+  const args = { projectId, auditId };
+  const ctx = makeToolContext();
+  const parent = {
+    id: auditId,
+    projectId,
+    status: "completed",
+    startUrl: "https://example.com/",
+    pagesCrawled: 10,
+    config: '{"maxPages":10,"lighthouseStrategy":"none"}',
+  };
+
+  it("rejects another tenant before audit lookup and rejects an audit outside the authorized project", async () => {
+    projectAccessMock.mockResolvedValueOnce(null);
+    await expect(getAuditFrontierTool.handler(args, ctx)).rejects.toMatchObject(
+      { code: "FORBIDDEN" },
+    );
+    expect(projectAuditMock).not.toHaveBeenCalled();
+    await expect(getAuditFrontierTool.handler(args, ctx)).rejects.toMatchObject(
+      { code: "NOT_FOUND" },
+    );
+    expect(projectAuditMock).toHaveBeenCalledWith(auditId, projectId);
+  });
+
+  it("dispatches a successor once, and a replay reads the already observed instance", async () => {
+    let successor: {
+      id: string;
+      config: string;
+      status: string;
+      workflowInstanceId: string | null;
+    } | null = null;
+    projectAuditMock.mockImplementation(async (id: string) =>
+      id === auditId ? parent : successor,
+    );
+    reserveAuditMock.mockImplementation(
+      async (row: { id: string; config: object }) => {
+        if (successor) return false;
+        successor = {
+          id: row.id,
+          config: JSON.stringify(row.config),
+          status: "running",
+          workflowInstanceId: null,
+        };
+        return true;
+      },
+    );
+    claimLaunchMock.mockImplementation(async (id: string) => {
+      if (!successor || successor.workflowInstanceId !== null) return false;
+      successor.workflowInstanceId = id;
+      return true;
+    });
+    workflowCreateMock.mockResolvedValue(undefined);
+    getWorkflowMock.mockResolvedValue({
+      status: async () => ({ status: "running" }),
+    });
+    const launchArgs = { ...args, maxPages: 10 };
+    const [first, replay] = await Promise.all([
+      continueSiteAuditTool.handler(launchArgs, ctx),
+      continueSiteAuditTool.handler(launchArgs, ctx),
+    ]);
+    expect(
+      [first, replay].some(
+        (reply) => reply.structuredContent?.["dispatch"] === "accepted",
+      ),
+    ).toBe(true);
+    expect(workflowCreateMock).toHaveBeenCalledTimes(1);
+    await expect(
+      continueSiteAuditTool.handler(launchArgs, ctx),
+    ).resolves.toMatchObject({
+      structuredContent: { dispatch: "accepted" },
+    });
+    await expect(
+      continueSiteAuditTool.handler({ ...launchArgs, maxPages: 11 }, ctx),
+    ).resolves.toMatchObject({
+      structuredContent: {
+        dispatch: "not-sent",
+        reason: "VALIDATION_ERROR",
+        projectId,
+        parentAuditId: auditId,
+        maxPages: 11,
+      },
+    });
+    expect(workflowCreateMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("recovers only a matching unclaimed reservation and never resends an unknown launch", async () => {
+    const reservationId = "45e026b9-a7e9-4ea8-93ac-a1af93106953";
+    const reservation = {
+      ...parent,
+      id: "e1ab2ab3-d319-8f16-86a0-6c3bb49cc79a",
+      status: "running",
+      workflowInstanceId: null as string | null,
+      config: JSON.stringify({
+        maxPages: 10,
+        lighthouseStrategy: "none",
+        continuationFrom: auditId,
+        continuationReservation: reservationId,
+      }),
+    };
+    projectAuditMock.mockImplementation(async (id: string) =>
+      id === auditId
+        ? parent
+        : {
+            ...reservation,
+            id,
+          },
+    );
+    claimLaunchMock.mockImplementation(async (id: string) => {
+      if (reservation.workflowInstanceId !== null) return false;
+      reservation.workflowInstanceId = id;
+      return true;
+    });
+    workflowCreateMock.mockRejectedValueOnce(
+      new Error("Workflow transport lost acknowledgment"),
+    );
+    getWorkflowMock.mockRejectedValue(new Error("Instance not found"));
+    const recovery = {
+      ...args,
+      maxPages: 10,
+      recoverReservationId: reservationId,
+    };
+    for (const request of [recovery, recovery, { ...args, maxPages: 10 }]) {
+      await expect(
+        continueSiteAuditTool.handler(request, ctx),
+      ).resolves.toMatchObject({
+        structuredContent: { dispatch: "unknown" },
+      });
+    }
+    expect(workflowCreateMock).toHaveBeenCalledTimes(1);
+    expect(reserveAuditMock).not.toHaveBeenCalled();
+  });
+
+  it("refuses when a replacement reservation appears between recovery read and claim", async () => {
+    const before = "45e026b9-a7e9-4ea8-93ac-a1af93106953";
+    const after = "d874bc32-a6e1-400f-a18a-8030ac5d102f";
+    const config = (nonce: string) =>
+      JSON.stringify({
+        maxPages: 10,
+        lighthouseStrategy: "none",
+        continuationFrom: auditId,
+        continuationReservation: nonce,
+      });
+    let stored = config(before);
+    projectAuditMock.mockImplementation(async (id: string) =>
+      id === auditId
+        ? parent
+        : {
+            ...parent,
+            id,
+            status: "running",
+            workflowInstanceId: null,
+            config: stored,
+          },
+    );
+    claimLaunchMock.mockImplementation(
+      async (_id: string, _project: string, expected: string) => {
+        stored = config(after);
+        return stored === expected;
+      },
+    );
+    await expect(
+      continueSiteAuditTool.handler(
+        {
+          ...args,
+          maxPages: 10,
+          recoverReservationId: before,
+        },
+        ctx,
+      ),
+    ).resolves.toMatchObject({ structuredContent: { dispatch: "not-sent" } });
+    expect(claimLaunchMock).toHaveBeenCalledWith(
+      expect.any(String),
+      projectId,
+      config(before),
+    );
+    expect(workflowCreateMock).not.toHaveBeenCalled();
+  });
+});
 
 describe("run_site_audit page budget", () => {
   beforeEach(() => {

@@ -13,6 +13,13 @@ import {
   projects,
 } from "@/db/schema";
 import { executeInBatches } from "@/db/runBatch";
+import {
+  getPageLimitIssue,
+  readLegacyVisited,
+  countRunningForProject,
+  claimContinuationLaunch,
+  releaseUnsentContinuation,
+} from "./auditFrontierQueries";
 import { insertIssues } from "./auditIssueWrites";
 import { deterministicAuditRowId } from "@/server/lib/audit/ids";
 import type { DetectedIssue } from "@/server/lib/audit/issues/page-reporters";
@@ -28,12 +35,12 @@ async function createAudit(data: {
   projectId: string;
   startedByUserId: string;
   startUrl: string;
-  workflowInstanceId: string;
+  workflowInstanceId: string | null;
   config: AuditConfig;
   pagesTotal: number;
   lighthouseTotal: number;
 }) {
-  await db.insert(audits).values({
+  const insert = db.insert(audits).values({
     id: data.id,
     projectId: data.projectId,
     startedByUserId: data.startedByUserId,
@@ -45,6 +52,16 @@ async function createAudit(data: {
     lighthouseTotal: data.lighthouseTotal,
     currentPhase: "discovery",
   });
+  if (!data.config.continuationFrom) {
+    await insert;
+    return true;
+  }
+  // A parent has exactly one successor. A new reservation has no Workflow
+  // ID until one request atomically takes permission to dispatch.
+  const rows = await insert
+    .onConflictDoNothing({ target: audits.id })
+    .returning({ id: audits.id });
+  return rows.length === 1;
 }
 
 /** Records where the crawl really starts, once the workflow has probed the site. */
@@ -395,6 +412,11 @@ async function deleteAuditForProject(auditId: string, projectId: string) {
 
 export const AuditRepository = {
   createAudit,
+  getPageLimitIssue,
+  readLegacyVisited,
+  countRunningForProject,
+  claimContinuationLaunch,
+  releaseUnsentContinuation,
   updateAuditStart,
   updateAuditProgress,
   completeAudit,

@@ -120,6 +120,10 @@ import {
   runSiteAuditTool,
 } from "@/server/mcp/tools/site-audit-tools";
 import {
+  continueSiteAuditTool,
+  getAuditFrontierTool,
+} from "@/server/mcp/tools/site-audit-frontier-tools";
+import {
   deleteSiteAuditTool,
   listSiteAuditsTool,
 } from "@/server/mcp/tools/site-audit-cleanup-tools";
@@ -328,6 +332,8 @@ export function registerOpenSeoTools(
   register(getGoogleAnalyticsSiteSearchTool);
   register(getGoogleAnalyticsAudienceBreakdownTool);
   register(runSiteAuditTool);
+  register(getAuditFrontierTool);
+  register(continueSiteAuditTool);
   register(listSiteAuditsTool);
   register(deleteSiteAuditTool);
   register(getAuditStatusTool);

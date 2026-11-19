@@ -17,6 +17,9 @@ export interface AuditConfig {
   sitePlatform?: "shopify";
   /** Which crawler-access credential the crawl replayed, if any. */
   crawlerCredentialId?: string;
+  coverageVersion?: 2;
+  continuationFrom?: string;
+  continuationReservation?: string;
 }
 
 // Read-side only (writes stringify a typed AuditConfig). Stored rows may hold
@@ -40,6 +43,9 @@ const auditConfigSchema = z.object({
   // platform value must not make an old report unviewable.
   sitePlatform: z.literal("shopify").optional().catch(undefined),
   crawlerCredentialId: z.string().optional().catch(undefined),
+  coverageVersion: z.literal(2).optional(),
+  continuationFrom: z.uuid().optional(),
+  continuationReservation: z.uuid().optional(),
 });
 
 const auditConfigCodec = jsonCodec(auditConfigSchema);

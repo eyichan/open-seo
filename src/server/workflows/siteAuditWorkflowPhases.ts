@@ -1,6 +1,10 @@
 import type { WorkflowStep } from "cloudflare:workers";
 import type { BillingCustomerContext } from "@/server/billing/subscription";
-import { discoverUrls, parseRobotsTxt } from "@/server/lib/audit/discovery";
+import {
+  discoverUrls,
+  parseRobotsTxt,
+  readAuditRobots,
+} from "@/server/lib/audit/discovery";
 import {
   failedLighthouseFetch,
   fetchLighthouseResult,
@@ -15,18 +19,16 @@ import {
 } from "@/server/lib/audit/url-utils";
 import { isCrawlableUrl } from "@/server/lib/audit/url-policy";
 import { AuditRepository } from "@/server/features/audit/repositories/AuditRepository";
+import {
+  getAuditFrontier,
+  restoreAuditFrontier,
+} from "@/server/features/audit/services/AuditFrontier";
 import { getAuditScratchpad } from "@/server/features/audit/AuditScratchpad";
-import { AuditProgressKV } from "@/server/lib/audit/progress-kv";
-import { runMultipageChecks } from "@/server/lib/audit/issues/multipage";
 import type { AuditConfig } from "@/server/lib/audit/types";
 import type { CrawlerAccess } from "@/shared/crawler-access";
 import type { RenderUsage } from "@/shared/audit-rendering";
-import { captureServerEvent } from "@/server/lib/posthog";
-import { collectScratchpadIssues } from "@/server/workflows/siteAuditWorkflowPersist";
-import {
-  runCrawlPhase,
-  type CrawlPhaseResult,
-} from "@/server/workflows/siteAuditWorkflowCrawl";
+import { finalizeAudit } from "@/server/workflows/siteAuditWorkflowFinalize";
+import { runCrawlPhase } from "@/server/workflows/siteAuditWorkflowCrawl";
 import { pgStep } from "@/server/workflows/pgStep";
 import {
   DB_STEP,
@@ -58,6 +60,14 @@ type AuditPhasesParams = {
   renderHold?: { deadlineAt: number; credits: number };
 };
 
+export type DiscoveryResult = {
+  robotsText: string | null;
+  seededCount: number;
+  coverage?: string[];
+  cohortId?: string;
+  previouslyVisited?: number;
+};
+
 export async function runAuditPhases(
   step: WorkflowStep,
   params: AuditPhasesParams,
@@ -74,14 +84,21 @@ export async function runAuditPhases(
   const origin = getOrigin(startUrl);
   const maxPages = config.maxPages;
 
-  const discovery = await runDiscoveryPhase(step, {
+  const discoveryInput = {
     auditId,
     workflowInstanceId,
     origin,
     startUrl,
     maxPages,
     access,
-  });
+  };
+  const discovery = config.continuationFrom
+    ? await runContinuationDiscovery(step, {
+        ...discoveryInput,
+        projectId,
+        parentAuditId: config.continuationFrom,
+      })
+    : await runDiscoveryPhase(step, discoveryInput);
   // Parsed outside the step from checkpointed text, so replays see the exact
   // robots rules the original run used (a live re-fetch could differ and
   // desync the frontier from already-persisted crawl batches).
@@ -92,6 +109,7 @@ export async function runAuditPhases(
     maxPages,
     robots,
     seededCount: discovery.seededCount,
+    previouslyVisited: discovery.previouslyVisited,
     renderJavaScript: config.renderJavaScript,
     sitePlatform: config.sitePlatform,
   });
@@ -112,7 +130,70 @@ export async function runAuditPhases(
     startUrl,
     config,
     crawl,
+    discovery,
   });
+}
+
+async function runContinuationDiscovery(
+  step: WorkflowStep,
+  input: {
+    auditId: string;
+    workflowInstanceId: string;
+    projectId: string;
+    parentAuditId: string;
+    origin: string;
+    startUrl: string;
+    maxPages: number;
+    access?: CrawlerAccess | null;
+  },
+): Promise<DiscoveryResult> {
+  return pgStep(
+    step,
+    "restore-audit-frontier",
+    MULTIPAGE_CHECKS_STEP,
+    async () => {
+      const parent = await AuditRepository.getAuditForProject(
+        input.parentAuditId,
+        input.projectId,
+      );
+      if (!parent || parent.startUrl !== input.startUrl)
+        throw new Error("Continuation parent context mismatch");
+      const frontier = await getAuditFrontier(parent);
+      if (!frontier)
+        throw new Error("Continuation parent has no saved frontier");
+      const { robotsText, robotsCoverage } = await readAuditRobots(
+        input.origin,
+        input.access,
+      );
+      if (robotsCoverage === "unavailable" || robotsCoverage === "truncated") {
+        throw new Error("Cannot verify robots policy for the saved frontier");
+      }
+      await restoreAuditFrontier(
+        parent,
+        frontier,
+        getAuditScratchpad(input.auditId),
+        parseRobotsTxt(input.origin, robotsText).isAllowed,
+      );
+      await AuditRepository.updateAuditProgress(
+        input.auditId,
+        input.workflowInstanceId,
+        {
+          pagesTotal: Math.min(input.maxPages, frontier.pendingCount),
+          currentPhase: "crawling",
+        },
+      );
+      return {
+        robotsText,
+        seededCount: frontier.pendingCount,
+        coverage:
+          frontier.version === 2 && frontier.robotsText !== robotsText
+            ? [...new Set([...frontier.discoveryGaps, "robots-policy-changed"])]
+            : frontier.discoveryGaps,
+        cohortId: frontier.cohortId,
+        previouslyVisited: frontier.cumulativeVisited,
+      };
+    },
+  );
 }
 
 async function runDiscoveryPhase(
@@ -125,7 +206,7 @@ async function runDiscoveryPhase(
     maxPages: number;
     access?: CrawlerAccess | null;
   },
-) {
+): Promise<DiscoveryResult> {
   const { auditId, workflowInstanceId, origin, startUrl, maxPages, access } =
     input;
   // "-v2": the checkpoint shape changed (seeds now live in the scratchpad DO
@@ -174,7 +255,11 @@ async function runDiscoveryPhase(
       pagesTotal: Math.min(seededCount, maxPages),
       currentPhase: "crawling",
     });
-    return { robotsText: result.robotsText, seededCount };
+    return {
+      robotsText: result.robotsText,
+      seededCount,
+      coverage: result.coverage,
+    };
   });
 }
 
@@ -320,111 +405,5 @@ async function selectLighthousePages(params: {
     return crawledPages.flatMap((page) =>
       selectedUrls.has(page.url) ? [{ url: page.url, pageId: page.id }] : [],
     );
-  });
-}
-
-async function finalizeAudit(args: {
-  step: WorkflowStep;
-  auditId: string;
-  workflowInstanceId: string;
-  billingCustomer: BillingCustomerContext;
-  projectId: string;
-  startUrl: string;
-  config: AuditConfig;
-  crawl: CrawlPhaseResult;
-}) {
-  const {
-    step,
-    auditId,
-    workflowInstanceId,
-    billingCustomer,
-    projectId,
-    startUrl,
-    config,
-    crawl,
-  } = args;
-
-  await pgStep(step, "multipage-checks", MULTIPAGE_CHECKS_STEP, async () => {
-    await AuditRepository.updateAuditProgress(auditId, workflowInstanceId, {
-      currentPhase: "finalizing",
-    });
-
-    // Integrity guard: pages are persisted inside crawl-chunk steps. If the
-    // crawl claims pages but the DB has none, fail loudly instead of
-    // completing with an empty audit.
-    if (
-      crawl.pagesCrawled > 0 &&
-      !(await AuditRepository.hasPagesForAudit(auditId))
-    ) {
-      throw new Error(
-        `Audit ${auditId}: crawl reported ${crawl.pagesCrawled} pages but none were persisted`,
-      );
-    }
-
-    const checksStartedAt = Date.now();
-    console.info("Audit finalization started", { auditId });
-    const { issues, hasUnreadShells } = await runMultipageChecks({ auditId });
-    console.info("Audit multipage checks completed", {
-      auditId,
-      durationMs: Date.now() - checksStartedAt,
-      issueCount: issues.length,
-    });
-    const linksStartedAt = Date.now();
-    const scratchpadIssues = await collectScratchpadIssues(
-      auditId,
-      projectId,
-      startUrl,
-      {
-        ...crawl,
-        completed: crawl.completed && !hasUnreadShells,
-      },
-    );
-    console.info("Audit coverage checks completed", {
-      auditId,
-      durationMs: Date.now() - linksStartedAt,
-      issueCount: scratchpadIssues.length,
-    });
-    issues.push(...scratchpadIssues);
-    const persistStartedAt = Date.now();
-    await AuditRepository.insertIssues(auditId, issues);
-    console.info("Audit finalization issues persisted", {
-      auditId,
-      durationMs: Date.now() - persistStartedAt,
-      issueCount: issues.length,
-    });
-    return { issueCount: issues.length };
-  });
-
-  await pgStep(step, "finalize", DB_STEP, async () => {
-    const blockedPages = await AuditRepository.countPagesByFetchClass(
-      auditId,
-      "blocked",
-    );
-    const rateLimitedPages = await AuditRepository.countPagesByFetchClass(
-      auditId,
-      "rate_limited",
-    );
-    await AuditRepository.completeAudit(auditId, workflowInstanceId, {
-      pagesCrawled: crawl.pagesCrawled,
-      pagesTotal: crawl.pagesCrawled,
-    });
-    await captureServerEvent({
-      distinctId: billingCustomer.userId,
-      event: "site_audit:complete",
-      organizationId: billingCustomer.organizationId,
-      properties: {
-        project_id: projectId,
-        status: "completed",
-        pages_crawled: crawl.pagesCrawled,
-        pages_total: crawl.pagesCrawled,
-        crawl_completed: crawl.completed,
-        pages_blocked: blockedPages,
-        pages_rate_limited: rateLimitedPages,
-        run_lighthouse: config.lighthouseStrategy !== "none",
-      },
-    });
-    await AuditProgressKV.clear(auditId);
-    // Crawl scratch state (frontier, links, mirror) is no longer needed.
-    await getAuditScratchpad(auditId).destroy();
   });
 }
