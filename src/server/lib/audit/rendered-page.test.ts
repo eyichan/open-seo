@@ -56,7 +56,7 @@ beforeEach(() => {
 });
 
 describe("rendered page providers", () => {
-  it("renders on Cloudflare with its full timeout and never calls Context", async () => {
+  it("gives JavaScript a bounded settling window without waiting for network idle", async () => {
     browser.quickAction.mockResolvedValue(
       cloudflare(200, html, url, { "set-cookie": "one\ntwo" }),
     );
@@ -68,7 +68,8 @@ describe("rendered page providers", () => {
     expect(browser.quickAction).toHaveBeenCalledWith("content", {
       url,
       cacheTTL: 0,
-      gotoOptions: { waitUntil: "networkidle2", timeout: 20_000 },
+      gotoOptions: { waitUntil: "domcontentloaded", timeout: 18_000 },
+      waitForTimeout: 2_000,
     });
   });
 

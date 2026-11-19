@@ -52,6 +52,7 @@ const contextSchema = z.object({
 // before JSON.parse as well as the decoded HTML before it reaches the parser.
 // A body cut off at the bound is incomplete JSON, so parsing rejects it.
 const MAX_RESPONSE_BYTES = 8 * MAX_HTML_BYTES;
+const CLOUDFLARE_SETTLE_MS = 2_000;
 async function readProviderJson(
   response: Response | BrowserResponse,
 ): Promise<unknown> {
@@ -84,10 +85,13 @@ async function renderWithCloudflare(
     const response = await browser.quickAction("content", {
       url,
       cacheTTL: 0,
+      // Background requests can keep the network busy after the DOM is ready.
+      // Give async scripts time to render within the existing attempt budget.
       gotoOptions: {
-        waitUntil: "networkidle2",
-        timeout: CLOUDFLARE_RENDER_TIMEOUT_MS,
+        waitUntil: "domcontentloaded",
+        timeout: CLOUDFLARE_RENDER_TIMEOUT_MS - CLOUDFLARE_SETTLE_MS,
       },
+      waitForTimeout: CLOUDFLARE_SETTLE_MS,
     });
     if (!response.ok) {
       await response.body?.cancel();
