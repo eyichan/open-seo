@@ -1,4 +1,8 @@
-import { MAX_HTML_BYTES, readTextUpTo } from "@/server/lib/audit/html-response";
+import {
+  MAX_HTML_BYTES,
+  readTextPrefix,
+  readTextUpTo,
+} from "@/server/lib/audit/html-response";
 import { classifyFetch } from "@/server/lib/audit/classify-fetch";
 import type { CrawledPageResult } from "@/server/lib/audit/types";
 import type { RenderedPage } from "@/server/lib/audit/rendered-page";
@@ -177,7 +181,11 @@ export async function crawlPage(
     let isHtml = contentType.includes("text/html");
     // Cap what we read: the first 1 MiB still contains the SEO metadata and
     // navigation needed by the audit in normal documents.
-    let body = isHtml ? await readTextUpTo(response, MAX_HTML_BYTES) : "";
+    const direct = isHtml
+      ? await readTextPrefix(response, MAX_HTML_BYTES)
+      : { text: "", capped: false };
+    let body = direct.text;
+    let htmlCapped = direct.capped;
     let fetchClass = classifyFetch(
       statusCode,
       Boolean(response.headers.get("cf-mitigated")),
@@ -203,6 +211,7 @@ export async function crawlPage(
       try {
         const page = await render(url);
         body = page.html;
+        htmlCapped = Boolean(page.htmlCapped);
         isHtml = true;
         // A challenge's or a 429's status was never the page's. Browser Run
         // reports the status it loaded; Context returns only pages that loaded.
@@ -234,6 +243,7 @@ export async function crawlPage(
         // The body was still fetched and buffered; report its size so the
         // crawl window's byte budget sees blocked/error pages too.
         htmlBytes: body.length,
+        htmlCapped,
         rateLimited,
       });
     }
@@ -300,6 +310,9 @@ export async function crawlPage(
         .length,
       images: analysis.images,
       links: analysis.links,
+      linkCaptureIncomplete: Boolean(
+        javascriptShell || htmlCapped || analysis.linkExtractionTruncated,
+      ),
       hasStructuredData: analysis.hasStructuredData,
       hreflangTags: analysis.hreflangTags,
       isIndexable,
@@ -338,6 +351,7 @@ function emptyPageResult(input: {
   crawlDepth: number | null;
   inSitemap: boolean;
   htmlBytes?: number;
+  htmlCapped?: boolean;
   rateLimited?: boolean;
 }): CrawledPageResult {
   return {
@@ -371,6 +385,10 @@ function emptyPageResult(input: {
     imagesMissingAlt: 0,
     images: [],
     links: [],
+    linkCaptureIncomplete:
+      Boolean(input.htmlCapped) ||
+      input.fetchClass !== "ok" ||
+      input.statusCode >= 500,
     hasStructuredData: false,
     hreflangTags: [],
     isIndexable: false,

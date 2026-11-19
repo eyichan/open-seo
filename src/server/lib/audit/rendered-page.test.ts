@@ -127,9 +127,10 @@ describe("rendered page providers", () => {
       cloudflare(200, head + "x".repeat(MAX_HTML_BYTES)),
     );
     const fetchMock = vi.spyOn(globalThis, "fetch");
-    const { html: rendered } = await render().page;
+    const { html: rendered, htmlCapped } = await render().page;
     expect(rendered.startsWith(head)).toBe(true);
     expect(new TextEncoder().encode(rendered).length).toBe(MAX_HTML_BYTES);
+    expect(htmlCapped).toBe(true);
     expect(fetchMock).not.toHaveBeenCalled();
   });
 

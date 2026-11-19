@@ -39,7 +39,8 @@ Durable Object, one instance per audit (`idFromName(auditId)`):
 
 - **frontier** — URL queue and dedup set (URL primary key), with
   `pending / leased / crawled` states keyed by chunk number;
-- **links** — internal link edges, primary-keyed for idempotent re-insert;
+- **page_links** — each source page's normalized internal targets in one
+  idempotent write, with a flag for incomplete link capture;
 - **page_mirror** — the few columns the finalize link checks need.
 
 The app database (D1/Postgres) keeps only what the product reads: `audits`
@@ -125,11 +126,19 @@ issue output end to end.
   in bounded JSON parts under the audit's private R2 prefix. The page-limit
   finding records the prefix, part count, and URL count. Audit deletion
   removes the export along with the other audit payloads.
-- Guards where the platform has hard edges: link writes stop at a storage
-  budget (below the free-plan per-object SQLite cap; orphan detection is
-  skipped when the link graph was truncated), discovered-URL batches are
-  capped below the serialized-RPC limit, and sitemap documents are read up to
-  a byte cap and skipped whole beyond it.
+- Link capture is independent of frontier discovery. It retains extracted
+  internal targets within a byte budget per scratchpad row. Pages and
+  discoveries are split into bounded RPCs when needed. Each source page and
+  its discoveries are committed together, preserving the existing crawl
+  retry behavior. Orphan detection
+  requires a completed crawl and a completeness record for every source page.
+  Unread pages and HTML or link extraction limits can leave that graph
+  incomplete.
+  Broken-link findings can still use stored edges to confirmed failing
+  targets when coverage is partial. Link writes also stop at a storage budget
+  below the free-plan per-object SQLite cap.
+- Discovered-URL batches have a count limit, and sitemap documents are read
+  up to a byte cap and skipped whole beyond it.
 
 ## Consequences
 

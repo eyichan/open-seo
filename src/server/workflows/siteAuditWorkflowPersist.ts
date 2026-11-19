@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer";
 import type { RobotsResult } from "@/server/lib/audit/discovery";
 import type { AuditConfig, CrawledPageResult } from "@/server/lib/audit/types";
 import {
@@ -15,18 +16,15 @@ import { AuditRepository } from "@/server/features/audit/repositories/AuditRepos
 import {
   getAuditScratchpad,
   type FrontierStats,
-  type ScratchpadPageLinksRow,
 } from "@/server/features/audit/AuditScratchpad";
 import { AuditProgressKV } from "@/server/lib/audit/progress-kv";
 import { putTextToR2 } from "@/server/lib/r2";
 import type { CrawlPhaseResult } from "@/server/workflows/siteAuditWorkflowCrawl";
 
-/**
- * Mega-menu/footer-heavy sites can carry 1000+ links per page; cap what we
- * record so a 10k-page crawl can't produce tens of millions of link targets
- * to scan at finalize.
- */
-const MAX_STORED_LINKS_PER_PAGE = 500;
+// Leave room below the SQLite row and serialized RPC limits, respectively.
+// These bound link payloads by size, independent of menu link count.
+const MAX_LINK_ROW_BYTES = 1024 * 1024;
+const SCRATCHPAD_BATCH_BYTES = 24 * 1024 * 1024;
 /**
  * Cap newly discovered URLs sent to the scratchpad per persist sub-batch.
  * Serialized RPC messages are limited to 32 MiB; a crawler-trap page family
@@ -51,6 +49,78 @@ function shouldQueueCrawlLink(
     isAuditablePageUrl(link, sitePlatform) &&
     robots.isAllowed(link)
   );
+}
+
+type ScratchpadBatch = Parameters<
+  ReturnType<typeof getAuditScratchpad>["recordBatch"]
+>[0];
+
+function jsonStringBytes(value: string): number {
+  return Buffer.byteLength(JSON.stringify(value), "utf8");
+}
+
+function emptyScratchpadBatch(): ScratchpadBatch {
+  return { crawledUrls: [], pages: [], links: [], discovered: [] };
+}
+
+function scratchpadBatches(
+  sources: Array<{
+    page: CrawledPageResult;
+    discovered: ScratchpadBatch["discovered"];
+  }>,
+): ScratchpadBatch[] {
+  const batches: ScratchpadBatch[] = [];
+  let batch = emptyScratchpadBatch();
+  let batchBytes = 0;
+  const reserve = (bytes: number) => {
+    if (bytes > SCRATCHPAD_BATCH_BYTES) {
+      throw new Error("One scratchpad record exceeds the RPC byte budget");
+    }
+    if (batchBytes + bytes > SCRATCHPAD_BATCH_BYTES) {
+      batches.push(batch);
+      batch = emptyScratchpadBatch();
+      batchBytes = 0;
+    }
+    batchBytes += bytes;
+  };
+
+  for (const { page, discovered } of sources) {
+    const { id: pageId, url, statusCode, fetchClass, redirectUrl } = page;
+    const targets: string[] = [];
+    const sourceBytes = jsonStringBytes(url);
+    let rowBytes = sourceBytes + jsonStringBytes(pageId) + 32;
+    let incomplete = page.linkCaptureIncomplete !== false;
+    for (const link of page.links) {
+      if (!link.isInternal) continue;
+      const bytes = jsonStringBytes(link.targetUrl) + 1;
+      if (rowBytes + bytes > MAX_LINK_ROW_BYTES) {
+        incomplete = true;
+        continue;
+      }
+      rowBytes += bytes;
+      targets.push(link.targetUrl);
+    }
+    // Never split a source's discoveries from its page completion. A retry
+    // can refetch exactly those sources whose RPC never committed.
+    const discoveryBytes = discovered.reduce(
+      (bytes, entry) => bytes + jsonStringBytes(entry.url) + 48,
+      0,
+    );
+    reserve(
+      rowBytes +
+        2 * sourceBytes +
+        jsonStringBytes(redirectUrl ?? "") +
+        targets.length * 8 +
+        256 +
+        discoveryBytes,
+    );
+    batch.crawledUrls.push(url);
+    batch.pages.push({ pageId, url, statusCode, fetchClass, redirectUrl });
+    batch.links.push({ pageId, url, targets, incomplete });
+    batch.discovered.push(...discovered);
+  }
+  batches.push(batch);
+  return batches;
 }
 
 /**
@@ -85,52 +155,40 @@ export async function persistCrawledPages(input: {
   const issues = pages.flatMap((page) => runPageReporters(page));
   await AuditRepository.insertCrawledBatch(auditId, pages, issues);
 
-  const links: ScratchpadPageLinksRow[] = [];
-  const discovered = new Map<string, number | null>();
-  for (const page of pages) {
+  const seen = new Set<string>();
+  const sources = pages.map((page) => {
+    const discovered: ScratchpadBatch["discovered"] = [];
     const pageDepth = depthByUrl.get(page.url) ?? null;
     const childDepth = pageDepth === null ? null : pageDepth + 1;
 
-    const targets: string[] = [];
     for (const link of page.links) {
       if (!link.isInternal) continue;
-      if (targets.length < MAX_STORED_LINKS_PER_PAGE) {
-        targets.push(link.targetUrl);
-      }
       if (
-        discovered.size < MAX_DISCOVERED_PER_BATCH &&
-        !discovered.has(link.targetUrl) &&
+        seen.size < MAX_DISCOVERED_PER_BATCH &&
+        !seen.has(link.targetUrl) &&
         shouldQueueCrawlLink(link.targetUrl, origin, robots, sitePlatform)
       ) {
-        discovered.set(link.targetUrl, childDepth);
+        seen.add(link.targetUrl);
+        discovered.push({ url: link.targetUrl, depth: childDepth });
       }
     }
-    if (targets.length > 0) {
-      links.push({ pageId: page.id, url: page.url, targets });
-    }
-
     // Redirect targets continue the same navigation path: same depth.
     if (
       page.redirectUrl &&
-      !discovered.has(page.redirectUrl) &&
+      !seen.has(page.redirectUrl) &&
       shouldQueueCrawlLink(page.redirectUrl, origin, robots, sitePlatform)
     ) {
-      discovered.set(page.redirectUrl, pageDepth);
+      seen.add(page.redirectUrl);
+      discovered.push({ url: page.redirectUrl, depth: pageDepth });
     }
-  }
-
-  const stats = await scratchpad.recordBatch({
-    crawledUrls: pages.map((page) => page.url),
-    pages: pages.map((page) => ({
-      pageId: page.id,
-      url: page.url,
-      statusCode: page.statusCode,
-      fetchClass: page.fetchClass,
-      redirectUrl: page.redirectUrl,
-    })),
-    links,
-    discovered: Array.from(discovered, ([url, depth]) => ({ url, depth })),
+    return { page, discovered };
   });
+
+  const [firstBatch, ...remainingBatches] = scratchpadBatches(sources);
+  let stats = await scratchpad.recordBatch(firstBatch);
+  for (const batch of remainingBatches) {
+    stats = await scratchpad.recordBatch(batch);
+  }
 
   await AuditRepository.updateAuditProgress(auditId, input.workflowInstanceId, {
     pagesCrawled: stats.attempted,

@@ -6,7 +6,15 @@ export async function readTextUpTo(
   response: Response | BrowserResponse,
   maxBytes: number,
 ) {
-  if (!response.body) return "";
+  return (await readTextPrefix(response, maxBytes)).text;
+}
+
+/** Whether the reader stopped at the cap without observing end of stream. */
+export async function readTextPrefix(
+  response: Response | BrowserResponse,
+  maxBytes: number,
+) {
+  if (!response.body) return { text: "", capped: false };
 
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
@@ -37,15 +45,17 @@ export async function readTextUpTo(
   }
 
   parts.push(decoder.decode());
-  return parts.join("");
+  return { text: parts.join(""), capped: bytesRead >= maxBytes };
 }
 
 /** The first `maxBytes` of `text` as UTF-8, as readTextUpTo keeps from a body. */
-export function truncateToBytes(text: string, maxBytes: number) {
+export function truncateText(text: string, maxBytes: number) {
   const bytes = new TextEncoder().encode(text);
-  return bytes.length <= maxBytes
-    ? text
-    : new TextDecoder().decode(bytes.subarray(0, maxBytes));
+  const capped = bytes.length > maxBytes;
+  return {
+    text: capped ? new TextDecoder().decode(bytes.subarray(0, maxBytes)) : text,
+    capped,
+  };
 }
 
 /** Read a response body up to maxBytes; null when the body exceeds it. */

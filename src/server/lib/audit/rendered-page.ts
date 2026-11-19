@@ -8,7 +8,7 @@ import {
   type RenderUsage,
 } from "@/shared/audit-rendering";
 import { classifyFetch } from "./classify-fetch";
-import { MAX_HTML_BYTES, readTextUpTo, truncateToBytes } from "./html-response";
+import { MAX_HTML_BYTES, readTextUpTo, truncateText } from "./html-response";
 import { isCrawlableUrl } from "./url-policy";
 import { normalizeUrl } from "./url-utils";
 
@@ -70,11 +70,16 @@ function usableHtml(url: string, finalUrl: string, html: string) {
     throw new Error("Rendering returned a different URL");
   }
   if (!html.trim()) throw new Error("Rendered HTML is empty");
-  return truncateToBytes(html, MAX_HTML_BYTES);
+  const { text, capped } = truncateText(html, MAX_HTML_BYTES);
+  return capped ? { html: text, htmlCapped: true } : { html: text };
 }
 
 /** The rendered HTML, with the origin's status when the renderer reports it. */
-export type RenderedPage = { html: string; status: number | null };
+export type RenderedPage = {
+  html: string;
+  status: number | null;
+  htmlCapped?: boolean;
+};
 
 /** Null when Cloudflare failed, was blocked, or saw an origin error. */
 async function renderWithCloudflare(
@@ -99,18 +104,18 @@ async function renderWithCloudflare(
     }
     const data = cloudflareSchema.parse(await readProviderJson(response));
     const { status, finalUrl, headers } = data.meta;
-    const html = usableHtml(url, finalUrl, data.result);
+    const rendered = usableHtml(url, finalUrl, data.result);
     const mitigated = Object.entries(headers ?? {}).some(
       ([name, value]) =>
         name.toLowerCase() === "cf-mitigated" && Boolean(value.trim()),
     );
     if (
       status >= 400 ||
-      classifyFetch(status, mitigated, html.slice(0, 4_000)) !== "ok"
+      classifyFetch(status, mitigated, rendered.html.slice(0, 4_000)) !== "ok"
     ) {
       return null;
     }
-    return { html, status };
+    return { ...rendered, status };
   } catch {
     // Provider bodies/errors can contain page data. Nothing raw is logged.
     return null;
@@ -121,7 +126,7 @@ async function renderWithContext(
   url: string,
   contextFetch: typeof fetch,
 ): Promise<{
-  html: string | null;
+  rendered: Omit<RenderedPage, "status"> | null;
   credits: number;
   httpStatus: number | null;
 }> {
@@ -136,7 +141,7 @@ async function renderWithContext(
     "timeoutOpts[behavior]": "fail",
   }).toString();
 
-  let html: string | null = null;
+  let rendered: Omit<RenderedPage, "status"> | null = null;
   let creditsUsed: number | null = null;
   let httpStatus: number | null = null;
   try {
@@ -152,14 +157,14 @@ async function renderWithContext(
       : null;
     if (!response.ok) throw new Error(`Rendering provider HTTP ${httpStatus}`);
     const data = contextSchema.parse(json);
-    html = usableHtml(url, data.metadata.finalUrl, data.html);
+    rendered = usableHtml(url, data.metadata.finalUrl, data.html);
   } catch {
     // Provider bodies/errors can contain page data or credentials. Nothing
     // raw is logged, and a paid call is never retried automatically.
   }
   // Context charges one credit per scrape. Bill what it reports; only assume
   // one credit for a usable page that omits its usage, never for a failure.
-  return { html, credits: creditsUsed ?? (html ? 1 : 0), httpStatus };
+  return { rendered, credits: creditsUsed ?? (rendered ? 1 : 0), httpStatus };
 }
 
 /**
@@ -187,7 +192,7 @@ async function renderPage(
   }
 
   if (options.contextFetch) {
-    const { html, credits, httpStatus } = await renderWithContext(
+    const { rendered, credits, httpStatus } = await renderWithContext(
       url,
       options.contextFetch,
     );
@@ -197,10 +202,10 @@ async function renderPage(
       provider: "context",
       httpStatus,
       creditsUsed: credits,
-      outcome: html ? "ok" : "error",
+      outcome: rendered ? "ok" : "error",
     });
     // Context reports no origin status.
-    if (html) return { html, status: null };
+    if (rendered) return { ...rendered, status: null };
   }
   throw new Error("Unable to render this page");
 }

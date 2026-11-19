@@ -24,6 +24,7 @@ import {
   BROKEN_LINKS_SQL,
   FRONTIER_CLAIM_SQL,
   FRONTIER_DISCOVER_SQL,
+  INCOMPLETE_LINK_GRAPH_SQL,
   ORPHAN_PAGES_SQL,
   SCRATCHPAD_SCHEMA_SQL,
 } from "@/server/features/audit/scratchpad-sql";
@@ -69,6 +70,8 @@ export interface ScratchpadPageLinksRow {
   url: string;
   /** Same-origin link targets, already deduped by the page analyzer. */
   targets: string[];
+  /** True when extraction or bounded RPC/row packing omitted a target. */
+  incomplete?: boolean;
 }
 
 interface RecordBatchInput {
@@ -99,7 +102,8 @@ const CLEANUP_AFTER_MS = 7 * 24 * 60 * 60 * 1000;
  * arrays are the only unbounded-per-page data; a pathological link-dense site
  * could otherwise hit the platform's per-object SQLite cap (1 GB on the free
  * plan self-hosters may run on) and fail the crawl with SQLITE_FULL. Past the
- * budget the crawl continues — the audit just loses link-graph issues.
+ * budget the crawl continues with partial broken link coverage and no orphan
+ * conclusions.
  */
 const LINK_STORAGE_BUDGET_BYTES = 500 * 1024 * 1024;
 
@@ -189,6 +193,10 @@ export class AuditScratchpad extends DurableObject {
 
   /** Persist one crawled sub-batch: completions, mirror rows, links, frontier. */
   async recordBatch(input: RecordBatchInput): Promise<FrontierStats> {
+    return this.ctx.storage.transactionSync(() => this.storeBatch(input));
+  }
+
+  private storeBatch(input: RecordBatchInput): FrontierStats {
     for (const url of input.crawledUrls) {
       this.ctx.storage.sql.exec(
         `UPDATE frontier SET state = 'crawled' WHERE url = ?`,
@@ -215,7 +223,13 @@ export class AuditScratchpad extends DurableObject {
           `INSERT OR REPLACE INTO page_links (page_id, url, targets_json) VALUES (?, ?, ?)`,
           page.pageId,
           page.url,
-          JSON.stringify(page.targets),
+          // Old callers did not attest to completeness. Older readers still
+          // see the URL entries in new arrays.
+          JSON.stringify(
+            page.incomplete === undefined
+              ? page.targets
+              : [...page.targets, !page.incomplete],
+          ),
         );
       }
     }
@@ -294,18 +308,21 @@ export class AuditScratchpad extends DurableObject {
     // and nothing redirects to it. Only meaningful on a completed crawl with
     // a complete link graph — if the storage budget truncated link writes,
     // "no inbound edge" is missing data, not evidence of orphanhood.
+    const sql = this.ctx.storage.sql;
     const linkGraphComplete =
-      this.ctx.storage.sql.databaseSize < LINK_STORAGE_BUDGET_BYTES;
-    const orphanPages =
-      input.crawlCompleted && linkGraphComplete
-        ? this.ctx.storage.sql
-            .exec<{
-              page_id: string;
-              url: string;
-            }>(ORPHAN_PAGES_SQL, input.startUrl)
-            .toArray()
-            .map((row) => ({ pageId: row.page_id, url: row.url }))
-        : [];
+      input.crawlCompleted &&
+      sql.databaseSize < LINK_STORAGE_BUDGET_BYTES &&
+      sql.exec<{ incomplete: number }>(INCOMPLETE_LINK_GRAPH_SQL).one()
+        .incomplete === 0;
+    const orphanPages = linkGraphComplete
+      ? sql
+          .exec<{
+            page_id: string;
+            url: string;
+          }>(ORPHAN_PAGES_SQL, input.startUrl)
+          .toArray()
+          .map((row) => ({ pageId: row.page_id, url: row.url }))
+      : [];
 
     return { brokenLinks, orphanPages };
   }

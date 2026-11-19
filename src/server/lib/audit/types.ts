@@ -89,6 +89,7 @@ export interface PageAnalysis {
 
   // Links (normalized, deduped by target)
   links: PageLink[];
+  linkExtractionTruncated?: boolean;
 
   // Structured data
   hasStructuredData: boolean;
@@ -168,6 +169,8 @@ export interface CrawledPageResult {
   imagesMissingAlt: number;
   images: Array<{ src: string | null; alt: string | null }>;
   links: PageLink[];
+  /** Unread or capped HTML can hide internal targets. */
+  linkCaptureIncomplete?: boolean;
   hasStructuredData: boolean;
   hreflangTags: string[];
   isIndexable: boolean;

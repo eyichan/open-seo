@@ -10,6 +10,7 @@ import {
   BROKEN_LINKS_SQL,
   FRONTIER_CLAIM_SQL,
   FRONTIER_DISCOVER_SQL,
+  INCOMPLETE_LINK_GRAPH_SQL,
   ORPHAN_PAGES_SQL,
   SCRATCHPAD_SCHEMA_SQL,
 } from "@/server/features/audit/scratchpad-sql";
@@ -39,7 +40,11 @@ function addPage(
   );
 }
 
-function addLinks(pageId: string, url: string, targets: string[]) {
+function addLinks(
+  pageId: string,
+  url: string,
+  targets: Array<string | boolean>,
+) {
   db.prepare(
     `INSERT OR REPLACE INTO page_links (page_id, url, targets_json) VALUES (?, ?, ?)`,
   ).run(pageId, url, JSON.stringify(targets));
@@ -183,6 +188,73 @@ describe("orphan pages", () => {
     expect(orphanPages()).toEqual([
       { page_id: "p3", url: "https://site.test/self" },
     ]);
+  });
+});
+
+describe("link graph capture", () => {
+  it("finds high-ordinal internal links and still identifies genuinely unlinked pages", () => {
+    const targets = Array.from(
+      { length: 517 },
+      (_, i) => `${START}target/${i + 1}?a=1&b=2`,
+    );
+    addPage("start", START);
+    addPage("linked-500", targets[499]);
+    addPage("broken-501", targets[500], { status: 404 });
+    addPage("linked-517", targets[516]);
+    addPage("lonely", `${START}lonely`);
+    addLinks("start", START, [...targets, true]);
+    for (const [id, url] of [
+      ["linked-500", targets[499]],
+      ["broken-501", targets[500]],
+      ["linked-517", targets[516]],
+      ["lonely", `${START}lonely`],
+    ]) {
+      addLinks(id, url, [true]);
+    }
+
+    expect(db.prepare(INCOMPLETE_LINK_GRAPH_SQL).get()).toEqual({
+      incomplete: 0,
+    });
+    expect(orphanPages()).toEqual([
+      { page_id: "lonely", url: `${START}lonely` },
+    ]);
+    expect(brokenLinks()).toEqual([
+      {
+        source_page_id: "start",
+        source_url: START,
+        target_url: targets[500],
+        target_status: 404,
+      },
+    ]);
+  });
+
+  it.each([
+    [499, undefined, 1],
+    [500, undefined, 1],
+    [500, true, 0],
+    [0, true, 0],
+    [0, false, 1],
+  ])(
+    "reads completeness for %i targets and marker %s",
+    (count, marker, expected) => {
+      const targets: Array<string | boolean> = Array.from(
+        { length: count },
+        (_, i) => `${START}target/${i}`,
+      );
+      addPage("start", START);
+      if (marker !== undefined) targets.push(marker);
+      addLinks("start", START, targets);
+      expect(db.prepare(INCOMPLETE_LINK_GRAPH_SQL).get()).toEqual({
+        incomplete: expected,
+      });
+    },
+  );
+
+  it("requires explicit capture for pages without a links row", () => {
+    addPage("start", START);
+    expect(db.prepare(INCOMPLETE_LINK_GRAPH_SQL).get()).toEqual({
+      incomplete: 1,
+    });
   });
 });
 

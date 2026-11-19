@@ -76,12 +76,17 @@ describe("crawlPage with JavaScript rendering", () => {
     );
     expect(await crawl()).toMatchObject({
       javascriptShell: true,
+      linkCaptureIncomplete: true,
       contentHash: null,
     });
     expect(await crawl(rendered(shell))).toMatchObject({
       javascriptShell: true,
+      linkCaptureIncomplete: true,
     });
-    expect(await crawl(rendered())).toMatchObject({ javascriptShell: false });
+    expect(await crawl(rendered())).toMatchObject({
+      javascriptShell: false,
+      linkCaptureIncomplete: false,
+    });
   });
 
   // Cloudflare's interstitial, then Imunify360's bot check.

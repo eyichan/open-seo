@@ -6,7 +6,8 @@
 
 /**
  * `page_links` holds one row per crawled page — its internal link targets as
- * a JSON array of URL strings — instead of one row per edge. Rows written is
+ * a JSON array of URL strings with a trailing completeness boolean —
+ * instead of one row per edge. Rows written is
  * the DO SQLite billing unit, and link edges dominate an audit's writes.
  * WITHOUT ROWID keeps the TEXT primary key as the table itself, so a page
  * costs exactly one row written rather than a row plus an autoindex entry.
@@ -103,7 +104,7 @@ export const BROKEN_LINKS_SQL = `
            m.status_code AS target_status
     FROM page_links p, json_each(p.targets_json) AS j
     CROSS JOIN page_mirror m ON m.url = j.value
-    WHERE m.status_code >= 400 AND m.fetch_class = 'ok'
+    WHERE j.type = 'text' AND m.status_code >= 400 AND m.fetch_class = 'ok'
     UNION ALL
     SELECT l.source_page_id, l.source_url, l.target_url, m.status_code AS target_status
     FROM links l JOIN page_mirror m ON m.url = l.target_url
@@ -113,23 +114,36 @@ export const BROKEN_LINKS_SQL = `
   LIMIT ?
 `;
 
+/** Every crawled page must attest to complete capture, including zero edges. */
+export const INCOMPLETE_LINK_GRAPH_SQL = `
+  SELECT EXISTS (
+    SELECT 1 FROM page_mirror m
+    LEFT JOIN page_links p ON p.page_id = m.page_id
+    WHERE json_type(p.targets_json, '$[#-1]') IS NOT 'true'
+  ) AS incomplete
+`;
+
 /**
  * Pages nothing links to. The inbound set is built once and anti-joined,
  * rather than probed per page: without the old per-edge target index a
  * correlated NOT EXISTS would rescan the whole edge set for every page.
  * Self-links don't count (a page linking to itself doesn't rescue it), and
  * page_id is 1:1 with url in page_mirror, so comparing URLs is the same test
- * the per-edge form made on ids. Takes the start URL as its only parameter.
+ * the per-edge form made on ids. Limit the materialized set to crawled URLs,
+ * even if link targets include millions of URLs outside that set. Takes the
+ * start URL as its only parameter.
  */
 export const ORPHAN_PAGES_SQL = `
   SELECT m.page_id, m.url FROM page_mirror m
   LEFT JOIN (
     SELECT DISTINCT j.value AS target_url
     FROM page_links p, json_each(p.targets_json) AS j
-    WHERE j.value != p.url
+    CROSS JOIN page_mirror candidate ON candidate.url = j.value
+    WHERE j.type = 'text' AND j.value != p.url
     UNION ALL
     SELECT DISTINCT l.target_url
     FROM links l
+    CROSS JOIN page_mirror candidate ON candidate.url = l.target_url
     WHERE l.target_url != l.source_url
   ) inbound ON inbound.target_url = m.url
   WHERE m.url != ?

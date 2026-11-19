@@ -121,7 +121,11 @@ const PAGE_URL = "https://example.com/blog/post";
 function expectParity(html: string) {
   const streamed = analyzeHtml(html, PAGE_URL, 200, 0);
   const reference = analyzeHtmlWithCheerio(html, PAGE_URL);
-  const { javascriptShell: _javascriptShell, ...existingAnalysis } = streamed;
+  const {
+    javascriptShell: _javascriptShell,
+    linkExtractionTruncated: _linkExtractionTruncated,
+    ...existingAnalysis
+  } = streamed;
   expect(existingAnalysis).toEqual(reference);
 }
 
@@ -278,6 +282,7 @@ describe("analyzeHtml extraction caps", () => {
       100,
     );
     expect(analysis.links).toHaveLength(1_000);
+    expect(analysis.linkExtractionTruncated).toBe(true);
     expect(analysis.images).toHaveLength(1_000);
   });
 });
