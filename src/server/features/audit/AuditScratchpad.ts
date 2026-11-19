@@ -235,6 +235,31 @@ export class AuditScratchpad extends DurableObject {
     }
   }
 
+  /** Read pending URLs for the capped audit report without leasing any work. */
+  async readPendingUrls(afterUrl: string, limit: number) {
+    // Use the URL primary-key range scan instead of sorting the pending
+    // state index again for each export page.
+    return this.ctx.storage.sql
+      .exec<{
+        url: string;
+        depth: number | null;
+        source: "link" | "sitemap";
+        in_sitemap: number;
+      }>(
+        `SELECT url, depth, source, in_sitemap FROM frontier
+         WHERE url > ? AND +state = 'pending' ORDER BY url LIMIT ?`,
+        afterUrl,
+        limit,
+      )
+      .toArray()
+      .map(({ url, depth, source, in_sitemap }) => ({
+        url,
+        depth,
+        source,
+        inSitemap: in_sitemap === 1,
+      }));
+  }
+
   async getStats(): Promise<FrontierStats> {
     return this.stats();
   }

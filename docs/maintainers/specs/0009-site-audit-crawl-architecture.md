@@ -121,6 +121,10 @@ issue output end to end.
   so any instantiation — including a write racing in after destroy, or a
   workflow that dies before seeding — is eventually wiped. Failed audits keep
   their scratchpad for those 7 days as the resume/debug artifact.
+- When a crawl reaches its page limit, finalization exports the pending URLs
+  in bounded JSON parts under the audit's private R2 prefix. The page-limit
+  finding records the prefix, part count, and URL count. Audit deletion
+  removes the export along with the other audit payloads.
 - Guards where the platform has hard edges: link writes stop at a storage
   budget (below the free-plan per-object SQLite cap; orphan detection is
   skipped when the link graph was truncated), discovered-URL batches are

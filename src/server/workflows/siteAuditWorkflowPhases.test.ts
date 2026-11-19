@@ -57,6 +57,7 @@ vi.mock("@/server/lib/audit/issues/multipage", () => ({
   runMultipageChecks: vi.fn(),
 }));
 vi.mock("@/server/lib/posthog", () => ({ captureServerEvent: vi.fn() }));
+vi.mock("@/server/lib/r2", () => ({ putTextToR2: vi.fn() }));
 vi.mock("@/server/workflows/siteAuditWorkflowCrawl", () => ({
   runCrawlPhase: vi.fn(),
 }));
@@ -70,6 +71,7 @@ import { AuditRepository } from "@/server/features/audit/repositories/AuditRepos
 import { getAuditScratchpad } from "@/server/features/audit/AuditScratchpad";
 import { runCrawlPhase } from "@/server/workflows/siteAuditWorkflowCrawl";
 import { runMultipageChecks } from "@/server/lib/audit/issues/multipage";
+import { putTextToR2 } from "@/server/lib/r2";
 
 const PHASE_PARAMS = {
   auditId: "audit-1",
@@ -253,4 +255,93 @@ describe("app-shell crawl coverage", () => {
       });
     },
   );
+});
+
+describe("capped crawl frontier", () => {
+  const pending = {
+    url: "https://example.com/unvisited",
+    depth: null,
+    source: "sitemap",
+    inSitemap: true,
+  };
+  const destroy = vi.fn();
+  const readPendingUrls = vi.fn();
+
+  beforeEach(() => {
+    vi.mocked(runCrawlPhase).mockResolvedValue({
+      pagesCrawled: 50,
+      completed: false,
+      stopIssue: {
+        issueType: "crawl-page-limit",
+        details: { pagesCrawled: 50, urlsNotCrawled: 1 },
+      },
+    });
+    vi.mocked(runMultipageChecks).mockResolvedValue({
+      issues: [],
+      hasUnreadShells: false,
+    });
+    // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion
+    vi.mocked(getAuditScratchpad).mockReturnValue({
+      runFinalizeChecks: vi.fn().mockResolvedValue({
+        brokenLinks: [],
+        orphanPages: [],
+      }),
+      readPendingUrls,
+      destroy,
+    } as unknown as ReturnType<typeof getAuditScratchpad>);
+    readPendingUrls.mockResolvedValue([pending]);
+    vi.mocked(putTextToR2).mockResolvedValue({ key: "", sizeBytes: 0 });
+    pgStepMock.mockImplementation(
+      async (
+        _step: unknown,
+        name: string,
+        _config: unknown,
+        callback: () => Promise<unknown>,
+      ) => {
+        if (name === "discover-urls-v2")
+          return { robotsText: "", seededCount: 1 };
+        return callback();
+      },
+    );
+  });
+
+  function finalizeCappedAudit() {
+    // pgStep supplies the workflow callbacks in these tests.
+    // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion
+    return runAuditPhases({} as never, {
+      ...PHASE_PARAMS,
+      config: { maxPages: 50, lighthouseStrategy: "none" },
+      renderUsage: { cloudflareAttempts: 0, contextCredits: 0 },
+    });
+  }
+
+  it("stores the pending URLs under the audit's private prefix before cleanup", async () => {
+    const prefix = "site-audit/project-1/audit-1/frontier/v1/";
+    await finalizeCappedAudit();
+    expect(putTextToR2).toHaveBeenCalledWith(
+      `${prefix}1.json`,
+      JSON.stringify([pending]),
+    );
+    expect(AuditRepository.insertIssues).toHaveBeenCalledWith("audit-1", [
+      {
+        issueType: "crawl-page-limit",
+        pageId: null,
+        pageUrl: PHASE_PARAMS.startUrl,
+        details: {
+          pagesCrawled: 50,
+          urlsNotCrawled: 1,
+          frontierPrefix: prefix,
+          frontierParts: 1,
+        },
+      },
+    ]);
+    expect(putTextToR2).toHaveBeenCalledBefore(destroy);
+  });
+
+  it("leaves the scratchpad available when the export cannot be written", async () => {
+    vi.mocked(putTextToR2).mockRejectedValue(new Error("storage unavailable"));
+    await expect(finalizeCappedAudit()).rejects.toThrow("storage unavailable");
+    expect(AuditRepository.insertIssues).not.toHaveBeenCalled();
+    expect(destroy).not.toHaveBeenCalled();
+  });
 });

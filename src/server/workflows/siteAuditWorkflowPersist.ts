@@ -1,16 +1,25 @@
 import type { RobotsResult } from "@/server/lib/audit/discovery";
 import type { AuditConfig, CrawledPageResult } from "@/server/lib/audit/types";
-import { isAuditablePageUrl, isSameOrigin } from "@/server/lib/audit/url-utils";
+import {
+  isAuditablePageUrl,
+  isSameOrigin,
+  normalizeUrl,
+} from "@/server/lib/audit/url-utils";
 import { isCrawlableUrl } from "@/server/lib/audit/url-policy";
 import { deterministicAuditRowId } from "@/server/lib/audit/ids";
-import { runPageReporters } from "@/server/lib/audit/issues/page-reporters";
+import {
+  runPageReporters,
+  type DetectedIssue,
+} from "@/server/lib/audit/issues/page-reporters";
 import { AuditRepository } from "@/server/features/audit/repositories/AuditRepository";
-import type {
+import {
   getAuditScratchpad,
-  FrontierStats,
-  ScratchpadPageLinksRow,
+  type FrontierStats,
+  type ScratchpadPageLinksRow,
 } from "@/server/features/audit/AuditScratchpad";
 import { AuditProgressKV } from "@/server/lib/audit/progress-kv";
+import { putTextToR2 } from "@/server/lib/r2";
+import type { CrawlPhaseResult } from "@/server/workflows/siteAuditWorkflowCrawl";
 
 /**
  * Mega-menu/footer-heavy sites can carry 1000+ links per page; cap what we
@@ -27,6 +36,8 @@ const MAX_STORED_LINKS_PER_PAGE = 500;
  */
 const MAX_DISCOVERED_PER_BATCH = 20_000;
 const MAX_PROGRESS_TITLE_CHARS = 300;
+/** Keep each scratchpad read and R2 write bounded independently of crawl size. */
+const FRONTIER_EXPORT_BATCH = 500;
 
 function shouldQueueCrawlLink(
   link: string,
@@ -135,4 +146,88 @@ export async function persistCrawledPages(input: {
     })),
   );
   return stats;
+}
+
+// Reuse the audit's private R2 prefix so audit, project and account deletion
+// reclaim the export. Stable part keys make retries overwrite the same data.
+async function exportCappedFrontier(
+  projectId: string,
+  auditId: string,
+  expectedCount: number,
+) {
+  const scratchpad = getAuditScratchpad(auditId);
+  const frontierPrefix = `site-audit/${projectId}/${auditId}/frontier/v1/`;
+  let afterUrl = "";
+  let frontierParts = 0;
+  let exported = 0;
+  for (;;) {
+    const rows = await scratchpad.readPendingUrls(
+      afterUrl,
+      FRONTIER_EXPORT_BATCH,
+    );
+    const last = rows.at(-1);
+    if (!last) break;
+    exported += rows.length;
+    if (exported > expectedCount) break;
+    frontierParts += 1;
+    await putTextToR2(
+      `${frontierPrefix}${frontierParts}.json`,
+      JSON.stringify(rows),
+    );
+    if (rows.length < FRONTIER_EXPORT_BATCH) break;
+    afterUrl = last.url;
+  }
+  if (exported !== expectedCount) {
+    throw new Error("Capped frontier does not match the pending URL count");
+  }
+  return { frontierPrefix, frontierParts };
+}
+
+/**
+ * Collect the audit's link and coverage findings before dropping scratch state.
+ */
+export async function collectScratchpadIssues(
+  auditId: string,
+  projectId: string,
+  startUrl: string,
+  crawl: CrawlPhaseResult,
+): Promise<DetectedIssue[]> {
+  const scratchpad = getAuditScratchpad(auditId);
+  const { brokenLinks, orphanPages } = await scratchpad.runFinalizeChecks({
+    // Page rows store normalized URLs; normalize the start URL the same way
+    // so the orphan exclusion matches.
+    startUrl: normalizeUrl(startUrl) ?? startUrl,
+    // Orphan detection only makes sense when the crawl wasn't truncated.
+    crawlCompleted: crawl.completed,
+  });
+
+  const issues: DetectedIssue[] = [
+    ...brokenLinks.map((row) => ({
+      issueType: "broken-internal-link" as const,
+      pageId: row.sourcePageId,
+      pageUrl: row.sourceUrl,
+      dedupeKey: row.targetUrl,
+      details: { targetUrl: row.targetUrl, targetStatus: row.targetStatus },
+    })),
+    ...orphanPages.map((row) => ({
+      issueType: "orphan-page" as const,
+      pageId: row.pageId,
+      pageUrl: row.url,
+    })),
+  ];
+  if (crawl.stopIssue) {
+    const { issueType, details } = crawl.stopIssue;
+    const urlsNotCrawled = details?.urlsNotCrawled;
+    const frontier =
+      issueType === "crawl-page-limit" && urlsNotCrawled
+        ? await exportCappedFrontier(projectId, auditId, urlsNotCrawled)
+        : undefined;
+    issues.push({
+      issueType,
+      pageId: null,
+      pageUrl: startUrl,
+      details: frontier ? { ...details, ...frontier } : details,
+    });
+  }
+  return issues;
 }
