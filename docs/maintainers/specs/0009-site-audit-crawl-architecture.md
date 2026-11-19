@@ -41,14 +41,32 @@ Durable Object, one instance per audit (`idFromName(auditId)`):
   `pending / leased / crawled` states keyed by chunk number, plus `prior` for
   URLs already attempted by an earlier segment;
 - **page_links** — each source page's normalized internal targets in one
-  idempotent write, with a flag for incomplete link capture;
-- **page_mirror** — the few columns the finalize link checks need.
+  idempotent write, with HTML eligibility and link-capture completeness;
+- **page_mirror** — the few columns the finalize link checks need;
+- **navigation_depth** — the finalization work queue and settled distances.
 
 The app database (D1/Postgres) keeps only what the product reads: `audits`
 (plus failure columns), `audit_pages`, `audit_issues`,
 `audit_lighthouse_results`. Link edges are never persisted to the app DB; the
 cross-page link checks (broken internal links, orphan pages) run as SQL inside
 the DO at finalize.
+
+### Navigation depth
+
+Finalization starts from the resolved audit URL and settles shortest paths in
+SQLite. Recorded same-origin anchors count as one click and recorded HTTP
+redirects add zero. Query variants retain their URL identity. A sitemap entry
+alone supplies no path, and canonical declarations do not add edges.
+
+A reachable page with missing outgoing evidence limits the depth that can be
+established. An unread redirect can open a path at the same distance. An
+omitted HTTP 2xx anchor can open a path one click later. The coverage manifest
+records the earliest distance at which an unknown route can begin and how
+many visited pages have a determined depth. The workflow saves the current
+segment's depths and reports analyzed HTML pages at five or more clicks.
+Continuation results use the cumulative graph for these findings and do not
+modify earlier audits. Older observations can lack the HTML eligibility
+signal, even when a path can be established.
 
 Rejected alternatives: Cloudflare Queues (no dedup, no counters, no completion
 signal — a frontier is mostly those things), a Postgres frontier table (chatty
@@ -92,9 +110,8 @@ insert-or-ignore/replace writes on stable keys.
 ### Crawl order and the page limit
 
 A chunk leases pages a link has reached first, oldest first, then pages only
-the sitemap lists. Link-found pages go first because a link is what gives a
-page its click depth, which the deep-page check reads; a page crawled straight
-from the sitemap has none.
+the sitemap lists. The provisional distance in the queue is used for crawl
+ordering. The depth report uses the settled navigation graph.
 
 Left at that, the order can spend the whole page limit on pages the sitemap
 doesn't list. Tag archives and filter pages link to more of themselves, so the

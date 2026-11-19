@@ -4,6 +4,16 @@ export const FRONTIER_PART_ROWS = 500;
 // Keep scratchpad RPC and Workflow heap use bounded even on link-dense pages.
 export const VISITED_PART_BYTES = 4 * 1024 * 1024;
 
+const pageCount = z.number().int().nonnegative();
+export const auditDepthCoverageSchema = z.object({
+  method: z.literal("captured-navigation-v1"),
+  firstIncompleteDepth: pageCount.nullable(),
+  cohortKnownPages: pageCount,
+  segmentKnownPages: pageCount,
+  knownPagesWithUnknownHtmlEligibility: pageCount,
+});
+export type AuditDepthCoverage = z.infer<typeof auditDepthCoverageSchema>;
+
 export const pendingUrlSchema = z
   .object({
     url: z.string().min(1),

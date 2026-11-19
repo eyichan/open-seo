@@ -64,6 +64,8 @@ export const getAuditFrontierTool = {
             pendingCount: frontier.pendingCount,
             unreadPages: frontier.unreadPages,
             graphComplete: frontier.graphComplete,
+            depthCoverage:
+              frontier.version === 2 ? (frontier.depthCoverage ?? null) : null,
             discoveryGaps: frontier.discoveryGaps,
             stop: frontier.stop,
             partCount,

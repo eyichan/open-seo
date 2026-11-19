@@ -34,6 +34,21 @@ const DEEP_PAGE_DEPTH = 5;
 // Meta tags are uncapped in the HTML, so bound the copy stored on each issue.
 const MAX_FLAGGED_TEXT_CHARS = 100;
 
+export function reportDeepPage(page: {
+  id: string | null;
+  url: string;
+  crawlDepth: number | null;
+}): DetectedIssue | null {
+  if (page.crawlDepth === null || page.crawlDepth < DEEP_PAGE_DEPTH)
+    return null;
+  return {
+    issueType: "deep-page",
+    pageId: page.id,
+    pageUrl: page.url,
+    details: { crawlDepth: page.crawlDepth },
+  };
+}
+
 function truncateFlaggedText(text: string): string {
   return text.length > MAX_FLAGGED_TEXT_CHARS
     ? `${text.slice(0, MAX_FLAGGED_TEXT_CHARS)}…`
@@ -111,9 +126,8 @@ export function runPageReporters(page: CrawledPageResult): DetectedIssue[] {
     report("canonicalized-page", { canonicalUrl: effectiveCanonical });
   }
 
-  if (page.crawlDepth !== null && page.crawlDepth >= DEEP_PAGE_DEPTH) {
-    report("deep-page", { crawlDepth: page.crawlDepth });
-  }
+  const deepPage = reportDeepPage(page);
+  if (deepPage) issues.push(deepPage);
 
   // The initial app shell cannot establish what the rendered page is missing.
   // Report the coverage gap instead of thin-content/missing-heading claims.

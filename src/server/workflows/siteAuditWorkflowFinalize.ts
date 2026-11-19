@@ -6,6 +6,9 @@ import { saveAuditFrontier } from "@/server/features/audit/services/AuditFrontie
 import { getAuditScratchpad } from "@/server/features/audit/AuditScratchpad";
 import { AuditProgressKV } from "@/server/lib/audit/progress-kv";
 import { runMultipageChecks } from "@/server/lib/audit/issues/multipage";
+import { reportDeepPage } from "@/server/lib/audit/issues/page-reporters";
+import { auditDepthCoverageSchema } from "@/server/lib/audit/frontier-checkpoint";
+import { normalizeUrl } from "@/server/lib/audit/url-utils";
 import type { AuditConfig } from "@/server/lib/audit/types";
 import { captureServerEvent } from "@/server/lib/posthog";
 import { collectScratchpadIssues } from "@/server/workflows/siteAuditWorkflowPersist";
@@ -40,11 +43,70 @@ export async function finalizeAudit(args: {
     discovery,
   } = args;
 
-  await pgStep(step, "multipage-checks", MULTIPAGE_CHECKS_STEP, async () => {
-    await AuditRepository.updateAuditProgress(auditId, workflowInstanceId, {
-      currentPhase: "finalizing",
-    });
+  const depthCoverage = await pgStep(
+    step,
+    "navigation-depth",
+    MULTIPAGE_CHECKS_STEP,
+    async () => {
+      await AuditRepository.updateAuditProgress(auditId, workflowInstanceId, {
+        currentPhase: "finalizing",
+      });
+      const scratchpad = getAuditScratchpad(auditId);
+      const root = normalizeUrl(startUrl);
+      if (!root) throw new Error("Invalid navigation root");
+      while (!(await scratchpad.advanceNavigation(root, config.sitePlatform))) {
+        // Each RPC commits a bounded portion. Retries continue the same graph.
+      }
+      const coverage = auditDepthCoverageSchema.parse(
+        await scratchpad.readNavigationCoverage(),
+      );
+      // Checkpoint the cleanup before any result batch runs.
+      await AuditRepository.clearDepthIssues(auditId);
+      return coverage;
+    },
+  );
 
+  let cursor = 0;
+  let seen = 0;
+  for (;;) {
+    const after = cursor;
+    const result = await pgStep(
+      step,
+      `navigation-depth-write-${after}`,
+      DB_STEP,
+      async () => {
+        const rows = await getAuditScratchpad(auditId).readNavigationRows(
+          after,
+          depthCoverage.firstIncompleteDepth,
+        );
+        if (!rows.length) return { cursor: null, count: 0 };
+        const current = rows.filter((row) => row.current === 1);
+        if (current.length)
+          await AuditRepository.savePageDepths(auditId, current);
+        await AuditRepository.insertIssues(
+          auditId,
+          rows.flatMap((row) => {
+            const issue =
+              row.html === 1
+                ? reportDeepPage({
+                    ...row,
+                    id: row.current === 1 ? row.id : null,
+                  })
+                : null;
+            return issue ? [issue] : [];
+          }),
+        );
+        return { cursor: rows[rows.length - 1].cursor, count: current.length };
+      },
+    );
+    seen += result.count;
+    if (result.cursor === null) break;
+    cursor = result.cursor;
+  }
+  if (seen !== crawl.pagesCrawled)
+    throw new Error("Navigation depth rows do not match the audit segment");
+
+  await pgStep(step, "multipage-checks", MULTIPAGE_CHECKS_STEP, async () => {
     // Integrity guard: pages are persisted inside crawl-chunk steps. If the
     // crawl claims pages but the DB has none, fail loudly instead of
     // completing with an empty audit.
@@ -95,6 +157,7 @@ export async function finalizeAudit(args: {
         pendingCount: stats.pending,
         unreadPages: stats.unread,
         graphComplete: stats.incomplete === 0,
+        depthCoverage,
         discoveryGaps: sort([...graphGaps], (a, b) => a.localeCompare(b)),
         robotsText: discovery.robotsText,
         stop:

@@ -2,6 +2,7 @@ import { Buffer } from "node:buffer";
 import { afterEach, expect, it, vi } from "vitest";
 import { getAuditScratchpad } from "@/server/features/audit/AuditScratchpad";
 import type { AuditScratchpad } from "@/server/features/audit/AuditScratchpad";
+import { AuditRepository } from "@/server/features/audit/repositories/AuditRepository";
 import { createCrawlThrottle } from "@/server/lib/audit/crawl-throttle";
 import { parseRobotsTxt } from "@/server/lib/audit/discovery";
 import { MAX_HTML_BYTES } from "@/server/lib/audit/html-response";
@@ -57,12 +58,12 @@ async function crawlHtml(
   return page;
 }
 
-async function persist(pages: CrawledPageResult[]) {
+async function persist(pages: CrawledPageResult[], robotsText = "") {
   await persistCrawledPages({
     auditId: "audit",
     workflowInstanceId: "workflow",
     origin: ORIGIN,
-    robots: parseRobotsTxt(ORIGIN, ""),
+    robots: parseRobotsTxt(ORIGIN, robotsText),
     sitePlatform: undefined,
     scratchpad: getAuditScratchpad("audit"),
     pages,
@@ -70,6 +71,34 @@ async function persist(pages: CrawledPageResult[]) {
     maxPages: 1_500,
   });
 }
+
+it("keeps provisional depth out of stored pages and findings", async () => {
+  const page = await crawlHtml(
+    START,
+    '<a rel="nofollow" href="/next">Next</a>',
+  );
+  page.crawlDepth = 8;
+  await persist([page]);
+  const [, stored, issues] = vi.mocked(AuditRepository.insertCrawledBatch).mock
+    .lastCall!;
+  expect(stored[0].crawlDepth).toBeNull();
+  expect(issues.map((issue) => issue.issueType)).not.toContain("deep-page");
+  expect(recordBatch.mock.lastCall?.[0].links[0]).toMatchObject({
+    isHtml: true,
+    targets: [`${ORIGIN}/next`],
+  });
+});
+
+it("records a same-origin robots-excluded anchor as a navigation gap without leasing it", async () => {
+  const page = await crawlHtml(START, '<a href="/shortcut">Shortcut</a>');
+  await persist([page], "User-agent: *\nDisallow: /shortcut");
+  const batch = recordBatch.mock.lastCall?.[0];
+  expect(batch?.links[0]).toMatchObject({
+    targets: [`${ORIGIN}/shortcut`],
+    unqueuedFrom: 0,
+  });
+  expect(batch?.discovered).toEqual([]);
+});
 
 it("passes normalized URLs at positions 500, 501 and 517 to the link graph", async () => {
   const html = anchorList(

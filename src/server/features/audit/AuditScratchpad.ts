@@ -20,7 +20,13 @@
  */
 import { DurableObject, env } from "cloudflare:workers";
 import type { CrawlThrottleState } from "@/server/lib/audit/crawl-throttle";
+import type { AuditConfig } from "@/server/lib/audit/types";
 import { readVisitedUrls, restoreCheckpoint } from "./scratchpad-checkpoint";
+import {
+  advanceNavigation,
+  readNavigationCoverage,
+  readNavigationRows,
+} from "./scratchpad-navigation";
 import {
   BROKEN_LINKS_SQL,
   FRONTIER_CLAIM_SQL,
@@ -28,11 +34,12 @@ import {
   INCOMPLETE_LINK_GRAPH_SQL,
   ORPHAN_PAGES_SQL,
   SCRATCHPAD_SCHEMA_SQL,
+  serializeLinkCapture,
 } from "@/server/features/audit/scratchpad-sql";
 
 export interface ClaimedUrl {
   url: string;
-  /** Clicks from the start URL; null when only reachable via sitemap. */
+  /** Provisional click estimate for scheduling. Final depth is graph-derived. */
   depth: number | null;
   inSitemap: boolean;
 }
@@ -73,6 +80,10 @@ export interface ScratchpadPageLinksRow {
   targets: string[];
   /** True when extraction or bounded RPC/row packing omitted a target. */
   incomplete?: boolean;
+  isHtml?: boolean;
+  /** Unqueued navigation targets form the suffix of the target array. */
+  unqueuedFrom?: number;
+  unqueuedRedirect?: boolean;
 }
 
 interface RecordBatchInput {
@@ -226,21 +237,15 @@ export class AuditScratchpad extends DurableObject {
     // Database size only ever grows (deletes happen solely via destroy), so
     // once the budget trips it stays tripped — runFinalizeChecks uses the
     // same comparison to know the link graph is incomplete.
-    if (this.ctx.storage.sql.databaseSize < LINK_STORAGE_BUDGET_BYTES) {
-      for (const page of input.links) {
-        this.ctx.storage.sql.exec(
-          `INSERT OR REPLACE INTO page_links (page_id, url, targets_json) VALUES (?, ?, ?)`,
-          page.pageId,
-          page.url,
-          // Old callers did not attest to completeness. Older readers still
-          // see the URL entries in new arrays.
-          JSON.stringify(
-            page.incomplete === undefined
-              ? page.targets
-              : [...page.targets, !page.incomplete],
-          ),
-        );
-      }
+    const keepTargets =
+      this.ctx.storage.sql.databaseSize < LINK_STORAGE_BUDGET_BYTES;
+    for (const page of input.links) {
+      this.ctx.storage.sql.exec(
+        `INSERT OR REPLACE INTO page_links (page_id, url, targets_json) VALUES (?, ?, ?)`,
+        page.pageId,
+        page.url,
+        serializeLinkCapture(page, keepTargets),
+      );
     }
     for (const found of input.discovered) {
       this.ctx.storage.sql.exec(FRONTIER_DISCOVER_SQL, found.url, found.depth);
@@ -303,6 +308,25 @@ export class AuditScratchpad extends DurableObject {
       discoveryLimited:
         sql.exec("SELECT 1 FROM coverage_flags LIMIT 1").toArray().length > 0,
     };
+  }
+
+  async advanceNavigation(
+    startUrl: string,
+    sitePlatform?: AuditConfig["sitePlatform"],
+  ) {
+    return advanceNavigation(this.ctx.storage, startUrl, sitePlatform);
+  }
+
+  async readNavigationCoverage() {
+    return readNavigationCoverage(this.ctx.storage.sql);
+  }
+
+  async readNavigationRows(after: number, firstIncompleteDepth: number | null) {
+    return readNavigationRows(
+      this.ctx.storage.sql,
+      after,
+      firstIncompleteDepth,
+    );
   }
 
   async readVisitedUrls(afterUrl: string) {

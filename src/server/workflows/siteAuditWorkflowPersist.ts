@@ -36,17 +36,15 @@ const SCRATCHPAD_BATCH_BYTES = 24 * 1024 * 1024;
 const MAX_DISCOVERED_PER_BATCH = 20_000;
 const MAX_PROGRESS_TITLE_CHARS = 300;
 
-function shouldQueueCrawlLink(
+function isNavigationTarget(
   link: string,
   origin: string,
-  robots: RobotsResult,
   sitePlatform: AuditConfig["sitePlatform"],
 ): boolean {
   return (
     isSameOrigin(link, origin) &&
     isCrawlableUrl(link) &&
-    isAuditablePageUrl(link, sitePlatform) &&
-    robots.isAllowed(link)
+    isAuditablePageUrl(link, sitePlatform)
   );
 }
 
@@ -67,6 +65,7 @@ function scratchpadBatches(
     page: CrawledPageResult;
     discovered: ScratchpadBatch["discovered"];
   }>,
+  isUnqueuedNavigationTarget: (url: string) => boolean,
 ): ScratchpadBatch[] {
   const batches: ScratchpadBatch[] = [];
   let batch = emptyScratchpadBatch();
@@ -86,18 +85,22 @@ function scratchpadBatches(
   for (const { page, discovered } of sources) {
     const { id: pageId, url, statusCode, fetchClass, redirectUrl } = page;
     const targets: string[] = [];
+    const unqueuedTargets: string[] = [];
     const sourceBytes = jsonStringBytes(url);
-    let rowBytes = sourceBytes + jsonStringBytes(pageId) + 32;
+    let rowBytes = sourceBytes + jsonStringBytes(pageId) + 72;
     let incomplete = page.linkCaptureIncomplete !== false;
+    const unqueuedRedirect =
+      redirectUrl !== null && isUnqueuedNavigationTarget(redirectUrl);
     for (const link of page.links) {
       if (!link.isInternal) continue;
+      const unqueued = isUnqueuedNavigationTarget(link.targetUrl);
       const bytes = jsonStringBytes(link.targetUrl) + 1;
       if (rowBytes + bytes > MAX_LINK_ROW_BYTES) {
         incomplete = true;
         continue;
       }
       rowBytes += bytes;
-      targets.push(link.targetUrl);
+      (unqueued ? unqueuedTargets : targets).push(link.targetUrl);
     }
     // Never split a source's discoveries from its page completion. A retry
     // can refetch exactly those sources whose RPC never committed.
@@ -109,13 +112,21 @@ function scratchpadBatches(
       rowBytes +
         2 * sourceBytes +
         jsonStringBytes(redirectUrl ?? "") +
-        targets.length * 8 +
+        (targets.length + unqueuedTargets.length) * 8 +
         256 +
         discoveryBytes,
     );
     batch.crawledUrls.push(url);
     batch.pages.push({ pageId, url, statusCode, fetchClass, redirectUrl });
-    batch.links.push({ pageId, url, targets, incomplete });
+    batch.links.push({
+      pageId,
+      url,
+      targets: [...targets, ...unqueuedTargets],
+      incomplete,
+      isHtml: page.isHtml,
+      unqueuedFrom: targets.length,
+      unqueuedRedirect,
+    });
     batch.discovered.push(...discovered);
   }
   batches.push(batch);
@@ -151,12 +162,17 @@ export async function persistCrawledPages(input: {
   // Deterministic ids keep every write idempotent across step retries.
   for (const page of pages) {
     page.id = await deterministicAuditRowId(auditId, page.url);
+    // Claim-time depths order the crawl queue only. Persist depths and depth
+    // findings after all recorded navigation edges are available.
+    page.crawlDepth = null;
   }
   const issues = pages.flatMap((page) => runPageReporters(page));
   await AuditRepository.insertCrawledBatch(auditId, pages, issues);
 
   const seen = new Set<string>();
   let discoveryLimited = false;
+  const eligible = (url: string) =>
+    isNavigationTarget(url, origin, sitePlatform);
   const sources = pages.map((page) => {
     const discovered: ScratchpadBatch["discovered"] = [];
     const pageDepth = depthByUrl.get(page.url) ?? null;
@@ -165,7 +181,7 @@ export async function persistCrawledPages(input: {
     for (const link of page.links) {
       if (!link.isInternal || seen.has(link.targetUrl)) continue;
       if (discoveryLimited) break;
-      if (!shouldQueueCrawlLink(link.targetUrl, origin, robots, sitePlatform))
+      if (!eligible(link.targetUrl) || !robots.isAllowed(link.targetUrl))
         continue;
       if (seen.size >= MAX_DISCOVERED_PER_BATCH) {
         discoveryLimited = true;
@@ -178,7 +194,8 @@ export async function persistCrawledPages(input: {
     if (
       page.redirectUrl &&
       !seen.has(page.redirectUrl) &&
-      shouldQueueCrawlLink(page.redirectUrl, origin, robots, sitePlatform)
+      eligible(page.redirectUrl) &&
+      robots.isAllowed(page.redirectUrl)
     ) {
       seen.add(page.redirectUrl);
       discovered.push({ url: page.redirectUrl, depth: pageDepth });
@@ -186,7 +203,13 @@ export async function persistCrawledPages(input: {
     return { page, discovered };
   });
 
-  const [firstBatch, ...remainingBatches] = scratchpadBatches(sources);
+  const [firstBatch, ...remainingBatches] = scratchpadBatches(
+    sources,
+    (url) =>
+      !seen.has(url) &&
+      (discoveryLimited || !robots.isAllowed(url)) &&
+      eligible(url),
+  );
   if (discoveryLimited) firstBatch.discoveryLimited = true;
   let stats = await scratchpad.recordBatch(firstBatch);
   for (const batch of remainingBatches) {

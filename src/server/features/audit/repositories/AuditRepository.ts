@@ -21,6 +21,7 @@ import {
   releaseUnsentContinuation,
 } from "./auditFrontierQueries";
 import { insertIssues } from "./auditIssueWrites";
+import { clearDepthIssues, savePageDepths } from "./auditNavigationWrites";
 import { deterministicAuditRowId } from "@/server/lib/audit/ids";
 import type { DetectedIssue } from "@/server/lib/audit/issues/page-reporters";
 import type {
@@ -423,6 +424,8 @@ export const AuditRepository = {
   failAudit,
   getAuditForWorkflow,
   insertCrawledBatch,
+  clearDepthIssues,
+  savePageDepths,
   insertIssues,
   insertLighthouseResults,
   getAuditForProject,

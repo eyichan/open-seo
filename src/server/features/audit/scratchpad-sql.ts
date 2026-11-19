@@ -3,6 +3,32 @@
  * plain module (no `cloudflare:workers` import) so they can be exercised
  * against a real SQLite engine in tests as well as inside the Durable Object.
  */
+import type { ScratchpadPageLinksRow } from "./AuditScratchpad";
+
+export function serializeLinkCapture(
+  row: ScratchpadPageLinksRow,
+  keepTargets: boolean,
+) {
+  // Keep a bounded eligibility/capture record even after the edge budget is full.
+  // The last element is the completeness flag read by existing graph checks.
+  return JSON.stringify([
+    ...(keepTargets ? row.targets : []),
+    ...(row.isHtml === undefined
+      ? []
+      : [
+          {
+            html: row.isHtml,
+            unqueuedFrom: keepTargets
+              ? (row.unqueuedFrom ?? row.targets.length)
+              : 0,
+            unqueuedRedirect: row.unqueuedRedirect ?? false,
+          },
+        ]),
+    ...(keepTargets && row.incomplete === undefined
+      ? []
+      : [keepTargets && !row.incomplete]),
+  ]);
+}
 
 /**
  * `page_links` holds one row per crawled page — its internal link targets as
@@ -49,6 +75,17 @@ export const SCRATCHPAD_SCHEMA_SQL = `
   );
   CREATE INDEX IF NOT EXISTS page_mirror_redirect_idx ON page_mirror (redirect_url);
   CREATE TABLE IF NOT EXISTS coverage_flags (name TEXT PRIMARY KEY) WITHOUT ROWID;
+  CREATE TABLE IF NOT EXISTS navigation_depth (
+    page_rowid INTEGER PRIMARY KEY,
+    depth INTEGER NOT NULL,
+    settled INTEGER NOT NULL DEFAULT 0,
+    unknown_at INTEGER,
+    html INTEGER
+  );
+  CREATE INDEX IF NOT EXISTS navigation_depth_next_idx
+    ON navigation_depth (depth, page_rowid) WHERE settled = 0;
+  CREATE INDEX IF NOT EXISTS navigation_depth_gap_idx
+    ON navigation_depth (unknown_at) WHERE unknown_at IS NOT NULL;
 `;
 
 /**

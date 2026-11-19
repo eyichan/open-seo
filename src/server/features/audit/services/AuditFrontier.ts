@@ -8,10 +8,12 @@ import {
 } from "@/server/lib/r2";
 import {
   FRONTIER_PART_ROWS,
+  auditDepthCoverageSchema,
   pendingUrlSchema,
   visitedUrlSchema,
   type PendingUrl,
   type VisitedUrl,
+  type AuditDepthCoverage,
 } from "@/server/lib/audit/frontier-checkpoint";
 import { parseAuditConfig } from "@/server/lib/audit/types";
 import { isSameOrigin, normalizeUrl } from "@/server/lib/audit/url-utils";
@@ -50,6 +52,7 @@ const manifestSchema = z.object({
   unreadPages: integer,
   discoveryGaps: z.array(z.string()),
   graphComplete: z.boolean(),
+  depthCoverage: auditDepthCoverageSchema.optional(),
   stop: z.string(),
   robotsText: z.string().nullable(),
   pendingParts: z.array(digest),
@@ -117,6 +120,13 @@ export async function getAuditFrontier(
       (!manifest.parentAuditId && manifest.cohortId !== audit.id) ||
       manifest.cumulativeVisited < manifest.segmentPages ||
       manifest.unreadPages > manifest.cumulativeVisited ||
+      (manifest.depthCoverage &&
+        (manifest.depthCoverage.cohortKnownPages > manifest.cumulativeVisited ||
+          manifest.depthCoverage.segmentKnownPages > manifest.segmentPages ||
+          manifest.depthCoverage.segmentKnownPages >
+            manifest.depthCoverage.cohortKnownPages ||
+          manifest.depthCoverage.knownPagesWithUnknownHtmlEligibility >
+            manifest.depthCoverage.cohortKnownPages)) ||
       manifest.pendingParts.length !==
         (resumable
           ? Math.ceil(manifest.pendingCount / FRONTIER_PART_ROWS)
@@ -243,6 +253,7 @@ export async function saveAuditFrontier(input: {
   cumulativeVisited: number;
   unreadPages: number;
   graphComplete: boolean;
+  depthCoverage?: AuditDepthCoverage;
   discoveryGaps: string[];
   robotsText: string | null;
   stop: string;

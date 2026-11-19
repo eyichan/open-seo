@@ -340,8 +340,7 @@ describe("frontier claim", () => {
 
 describe("frontier link discovery", () => {
   // Seeding covers the whole sitemap, so most linked pages already have a
-  // sitemap row. A link must still give them a click depth and link-queue
-  // priority, or the deep-page check and breadth-first crawl order go blind.
+  // sitemap row. A discovery can give them provisional link-queue priority.
   it("gives a pending sitemap seed the link's depth and priority, keeping its sitemap flag", () => {
     const url = "https://site.test/post";
     db.prepare(

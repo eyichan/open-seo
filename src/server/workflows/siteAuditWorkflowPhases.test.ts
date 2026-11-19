@@ -239,6 +239,9 @@ describe("app-shell crawl coverage", () => {
         ) => {
           if (name === "discover-urls-v2")
             return { robotsText: "", seededCount: 2 };
+          if (name === "navigation-depth") return;
+          if (name === "navigation-depth-write-0")
+            return { cursor: null, count: 2 };
           return callback();
         },
       );
@@ -300,6 +303,9 @@ describe("capped crawl frontier", () => {
       ) => {
         if (name === "discover-urls-v2")
           return { robotsText: "", seededCount: 1 };
+        if (name === "navigation-depth") return;
+        if (name === "navigation-depth-write-0")
+          return { cursor: null, count: 50 };
         return callback();
       },
     );
