@@ -1,5 +1,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { beforeEach, describe, expect, it } from "vitest";
+import type { LinkCaptureReason } from "@/server/lib/audit/frontier-checkpoint";
+import { readCaptureCoverage } from "./scratchpad-depth-diagnostics";
 import {
   advanceNavigation,
   readNavigationCoverage,
@@ -43,7 +45,13 @@ function addLinks(
   targets: Array<
     | string
     | boolean
-    | { html: boolean; unqueuedFrom: number; unqueuedRedirect: boolean }
+    | {
+        html: boolean;
+        unqueuedFrom: number;
+        unqueuedRedirect: boolean;
+        robotsExcludedFrom?: number;
+        captureReason?: LinkCaptureReason;
+      }
   >,
 ) {
   db.prepare(
@@ -56,6 +64,7 @@ beforeEach(() => {
   db.exec(SCRATCHPAD_SCHEMA_SQL);
 });
 
+// eslint-disable-next-line max-lines-per-function -- The navigation cases share the same SQLite crawl fixtures.
 describe("navigation depth", () => {
   const url = (path: string) => new URL(path, START).href;
 
@@ -81,6 +90,8 @@ describe("navigation depth", () => {
       html?: boolean;
       incomplete?: boolean;
       unqueuedFrom?: number;
+      robotsExcludedFrom?: number;
+      captureReason?: LinkCaptureReason;
     } = {},
   ) {
     const source = url(path);
@@ -94,6 +105,8 @@ describe("navigation depth", () => {
         html: options.html ?? true,
         unqueuedFrom: options.unqueuedFrom ?? targets.length,
         unqueuedRedirect: false,
+        robotsExcludedFrom: options.robotsExcludedFrom,
+        captureReason: options.captureReason,
       },
       !options.incomplete,
     ]);
@@ -132,7 +145,7 @@ describe("navigation depth", () => {
   function finish(sitePlatform?: "shopify") {
     let batches = 1;
     while (!advanceNavigation(storage, START, sitePlatform)) batches++;
-    const coverage = readNavigationCoverage(storage.sql);
+    const coverage = readNavigationCoverage(storage.sql, START);
     let cursor = 0;
     const rows: ReturnType<typeof readNavigationRows> = [];
     for (;;) {
@@ -341,16 +354,71 @@ describe("navigation depth", () => {
     const pending = Array.from({ length: 5000 }, (_, i) => `/pending-${i}`);
     seed(["/", "/visible", "/deeper", ...pending]);
     capture("/", ["/visible", ...pending, "/blocked"], {
-      unqueuedFrom: pending.length + 1,
+      unqueuedFrom: 1,
+      robotsExcludedFrom: pending.length + 1,
     });
     capture("/visible", ["/deeper"]);
     capture("/deeper", []);
     const { rows, coverage, batches } = finish();
     expect(batches).toBe(1);
     expect(coverage.firstIncompleteDepth).toBe(1);
+    expect(
+      coverage.firstIncomplete?.samples.map(({ reason }) => reason),
+    ).toEqual(["pending-target", "robots-excluded"]);
     expect(rows.map(({ crawlDepth }) => crawlDepth)).toEqual([0, 1, null]);
     expect(
       db.prepare("SELECT count(*) AS n FROM navigation_depth").get()?.n,
     ).toBe(2);
+  });
+
+  it("retains the earliest blocked anchors and samples a separate body cap", () => {
+    seed(["/", "/chart"]);
+    capture("/", ["/chart", "/?secret", "/pkey"], {
+      unqueuedFrom: 1,
+      robotsExcludedFrom: 1,
+    });
+    capture("/chart", [], {
+      incomplete: true,
+      captureReason: "html-byte-limit",
+    });
+    const { coverage } = finish();
+    expect(coverage.firstIncompleteDepth).toBe(1);
+    expect(coverage.firstIncomplete).toEqual({
+      affectedSources: 1,
+      samples: [`${START}?…`, `${START}…`].map((target) => ({
+        source: START,
+        sourcePageId: "/",
+        reason: "robots-excluded",
+        target,
+      })),
+    });
+    expect(readCaptureCoverage(storage.sql, true).incompleteCapture).toEqual({
+      affectedPages: 1,
+      samples: [
+        {
+          source: `${START}…`,
+          sourcePageId: "/chart",
+          reason: "html-byte-limit",
+        },
+      ],
+    });
+  });
+
+  it("counts every earliest source while limiting the saved witness rows", () => {
+    const paths = Array.from({ length: 12 }, (_, i) => `/source-${i}`);
+    seed(["/", ...paths]);
+    capture("/", paths);
+    for (const path of paths) {
+      capture(path, ["/unfetched"], { unqueuedFrom: 0, robotsExcludedFrom: 1 });
+    }
+    const { coverage } = finish();
+    expect(coverage.firstIncompleteDepth).toBe(2);
+    expect(coverage.firstIncomplete?.affectedSources).toBe(12);
+    expect(coverage.firstIncomplete?.samples).toHaveLength(8);
+    expect(coverage.firstIncomplete?.samples[0]).toMatchObject({
+      reason: "discovery-limit",
+      source: `${START}…`,
+      target: `${START}…`,
+    });
   });
 });

@@ -257,6 +257,11 @@ export async function crawlPage(
     // Rendered HTML can still be the loading shell (a weak render), so the
     // same check applies whether or not the page was rendered.
     const javascriptShell = analysis.javascriptShell === true;
+    let linkCaptureReason: CrawledPageResult["linkCaptureReason"];
+    if (htmlCapped) linkCaptureReason = "html-byte-limit";
+    else if (javascriptShell) linkCaptureReason = "javascript-shell";
+    else if (analysis.linkExtractionTruncated)
+      linkCaptureReason = "link-extraction-limit";
     const robotsDirectives = [analysis.robotsMeta, xRobotsTag]
       .filter(Boolean)
       .join(",")
@@ -310,9 +315,8 @@ export async function crawlPage(
         .length,
       images: analysis.images,
       links: analysis.links,
-      linkCaptureIncomplete: Boolean(
-        javascriptShell || htmlCapped || analysis.linkExtractionTruncated,
-      ),
+      linkCaptureIncomplete: linkCaptureReason !== undefined,
+      linkCaptureReason,
       hasStructuredData: analysis.hasStructuredData,
       hreflangTags: analysis.hreflangTags,
       isIndexable,
@@ -354,6 +358,10 @@ function emptyPageResult(input: {
   htmlCapped?: boolean;
   rateLimited?: boolean;
 }): CrawledPageResult {
+  let linkCaptureReason: CrawledPageResult["linkCaptureReason"];
+  if (input.htmlCapped) linkCaptureReason = "html-byte-limit";
+  else if (input.fetchClass !== "ok" || input.statusCode >= 500)
+    linkCaptureReason = "unread-response";
   return {
     id: crypto.randomUUID(),
     url: input.url,
@@ -385,10 +393,8 @@ function emptyPageResult(input: {
     imagesMissingAlt: 0,
     images: [],
     links: [],
-    linkCaptureIncomplete:
-      Boolean(input.htmlCapped) ||
-      input.fetchClass !== "ok" ||
-      input.statusCode >= 500,
+    linkCaptureIncomplete: linkCaptureReason !== undefined,
+    linkCaptureReason,
     hasStructuredData: false,
     hreflangTags: [],
     isIndexable: false,

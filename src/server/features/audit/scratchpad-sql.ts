@@ -22,6 +22,13 @@ export function serializeLinkCapture(
               ? (row.unqueuedFrom ?? row.targets.length)
               : 0,
             unqueuedRedirect: row.unqueuedRedirect ?? false,
+            robotsExcludedFrom: keepTargets
+              ? row.robotsExcludedFrom
+              : undefined,
+            robotsExcludedRedirect: row.robotsExcludedRedirect,
+            captureReason:
+              row.captureReason ??
+              (keepTargets ? undefined : "link-storage-limit"),
           },
         ]),
     ...(keepTargets && row.incomplete === undefined

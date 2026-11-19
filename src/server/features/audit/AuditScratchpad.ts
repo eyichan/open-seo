@@ -20,8 +20,10 @@
  */
 import { DurableObject, env } from "cloudflare:workers";
 import type { CrawlThrottleState } from "@/server/lib/audit/crawl-throttle";
+import type { LinkCaptureReason } from "@/server/lib/audit/frontier-checkpoint";
 import type { AuditConfig } from "@/server/lib/audit/types";
 import { readVisitedUrls, restoreCheckpoint } from "./scratchpad-checkpoint";
+import { readCaptureCoverage } from "./scratchpad-depth-diagnostics";
 import {
   advanceNavigation,
   readNavigationCoverage,
@@ -80,10 +82,13 @@ export interface ScratchpadPageLinksRow {
   targets: string[];
   /** True when extraction or bounded RPC/row packing omitted a target. */
   incomplete?: boolean;
+  captureReason?: LinkCaptureReason;
   isHtml?: boolean;
   /** Unqueued navigation targets form the suffix of the target array. */
   unqueuedFrom?: number;
   unqueuedRedirect?: boolean;
+  robotsExcludedFrom?: number;
+  robotsExcludedRedirect?: boolean;
 }
 
 interface RecordBatchInput {
@@ -292,19 +297,11 @@ export class AuditScratchpad extends DurableObject {
     return this.stats();
   }
 
-  async getCoverage() {
+  async getCoverage(includeCaptureSamples = false) {
     const sql = this.ctx.storage.sql;
-    const stats = sql
-      .exec<{ visited: number; unread: number; incomplete: number }>(
-        `SELECT COUNT(*) AS visited,
-              COUNT(*) FILTER (WHERE m.fetch_class != 'ok') AS unread,
-              COUNT(*) FILTER (WHERE json_type(p.targets_json, '$[#-1]') IS NOT 'true') AS incomplete
-       FROM page_mirror m LEFT JOIN page_links p ON p.page_id = m.page_id`,
-      )
-      .one();
     return {
       ...this.stats(),
-      ...stats,
+      ...readCaptureCoverage(sql, includeCaptureSamples),
       discoveryLimited:
         sql.exec("SELECT 1 FROM coverage_flags LIMIT 1").toArray().length > 0,
     };
@@ -317,8 +314,8 @@ export class AuditScratchpad extends DurableObject {
     return advanceNavigation(this.ctx.storage, startUrl, sitePlatform);
   }
 
-  async readNavigationCoverage() {
-    return readNavigationCoverage(this.ctx.storage.sql);
+  async readNavigationCoverage(startUrl?: string) {
+    return readNavigationCoverage(this.ctx.storage.sql, startUrl);
   }
 
   async readNavigationRows(after: number, firstIncompleteDepth: number | null) {

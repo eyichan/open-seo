@@ -155,6 +155,25 @@ beforeEach(() => {
 });
 
 describe("audit checkpoint", () => {
+  it("reports an unavailable audit start when no matching page reached the graph", async () => {
+    const scratch = scratchpad();
+    const start = `${url}short-path-secret?verification=hidden`;
+    await scratch.advanceNavigation(start);
+    expect(await scratch.readNavigationCoverage(start)).toMatchObject({
+      firstIncompleteDepth: 0,
+      firstIncomplete: {
+        affectedSources: 0,
+        samples: [
+          {
+            sourcePageId: null,
+            target: `${url}…?…`,
+            reason: "start-unavailable",
+          },
+        ],
+      },
+    });
+  });
+
   it("restores a finite queue without reclaiming prior URLs and checks links across segments", async () => {
     const { parent, frontier } = await cappedAudit();
     const child = scratchpad();

@@ -96,6 +96,7 @@ it("records a same-origin robots-excluded anchor as a navigation gap without lea
   expect(batch?.links[0]).toMatchObject({
     targets: [`${ORIGIN}/shortcut`],
     unqueuedFrom: 0,
+    robotsExcludedFrom: 0,
   });
   expect(batch?.discovered).toEqual([]);
 });
@@ -129,6 +130,7 @@ it("keeps all long URLs that fit and marks genuine graph overflow", async () => 
   expect(batch?.discovered).toHaveLength(1_500);
   const row = batch?.links[1];
   expect(row?.incomplete).toBe(true);
+  expect(row?.captureReason).toBe("link-row-limit");
   expect(row?.targets.length).toBeLessThan(1_000);
   expect(row?.targets.length).toBeGreaterThan(500);
 });

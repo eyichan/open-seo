@@ -7,6 +7,7 @@ import { getAuditScratchpad } from "@/server/features/audit/AuditScratchpad";
 import { AuditProgressKV } from "@/server/lib/audit/progress-kv";
 import { runMultipageChecks } from "@/server/lib/audit/issues/multipage";
 import { reportDeepPage } from "@/server/lib/audit/issues/page-reporters";
+import { parseRobotsTxt } from "@/server/lib/audit/discovery";
 import { auditDepthCoverageSchema } from "@/server/lib/audit/frontier-checkpoint";
 import { normalizeUrl } from "@/server/lib/audit/url-utils";
 import type { AuditConfig } from "@/server/lib/audit/types";
@@ -58,8 +59,17 @@ export async function finalizeAudit(args: {
         // Each RPC commits a bounded portion. Retries continue the same graph.
       }
       const coverage = auditDepthCoverageSchema.parse(
-        await scratchpad.readNavigationCoverage(),
+        await scratchpad.readNavigationCoverage(root),
       );
+      const startGap = coverage.firstIncomplete?.samples[0];
+      if (
+        startGap?.reason === "start-unavailable" &&
+        !parseRobotsTxt(new URL(root).origin, discovery.robotsText).isAllowed(
+          root,
+        )
+      ) {
+        startGap.reason = "robots-excluded";
+      }
       // Checkpoint the cleanup before any result batch runs.
       await AuditRepository.clearDepthIssues(auditId);
       return coverage;
@@ -134,7 +144,7 @@ export async function finalizeAudit(args: {
     if (hasUnreadShells) graphGaps.add("unread-javascript-shell");
     if (config.coverageVersion === 2) {
       const scratchpad = getAuditScratchpad(auditId);
-      const stats = await scratchpad.getCoverage();
+      const stats = await scratchpad.getCoverage(true);
       if (
         stats.attempted !== crawl.pagesCrawled ||
         stats.visited !==
@@ -157,7 +167,10 @@ export async function finalizeAudit(args: {
         pendingCount: stats.pending,
         unreadPages: stats.unread,
         graphComplete: stats.incomplete === 0,
-        depthCoverage,
+        depthCoverage: {
+          ...depthCoverage,
+          incompleteCapture: stats.incompleteCapture,
+        },
         discoveryGaps: sort([...graphGaps], (a, b) => a.localeCompare(b)),
         robotsText: discovery.robotsText,
         stop:

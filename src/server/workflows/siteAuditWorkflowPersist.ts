@@ -65,7 +65,7 @@ function scratchpadBatches(
     page: CrawledPageResult;
     discovered: ScratchpadBatch["discovered"];
   }>,
-  isUnqueuedNavigationTarget: (url: string) => boolean,
+  unqueuedReason: (url: string) => "robots" | "limit" | null,
 ): ScratchpadBatch[] {
   const batches: ScratchpadBatch[] = [];
   let batch = emptyScratchpadBatch();
@@ -86,21 +86,26 @@ function scratchpadBatches(
     const { id: pageId, url, statusCode, fetchClass, redirectUrl } = page;
     const targets: string[] = [];
     const unqueuedTargets: string[] = [];
+    const robotsExcludedTargets: string[] = [];
     const sourceBytes = jsonStringBytes(url);
     let rowBytes = sourceBytes + jsonStringBytes(pageId) + 72;
     let incomplete = page.linkCaptureIncomplete !== false;
-    const unqueuedRedirect =
-      redirectUrl !== null && isUnqueuedNavigationTarget(redirectUrl);
+    let captureReason = page.linkCaptureReason;
+    const redirectReason =
+      redirectUrl === null ? null : unqueuedReason(redirectUrl);
     for (const link of page.links) {
       if (!link.isInternal) continue;
-      const unqueued = isUnqueuedNavigationTarget(link.targetUrl);
       const bytes = jsonStringBytes(link.targetUrl) + 1;
       if (rowBytes + bytes > MAX_LINK_ROW_BYTES) {
         incomplete = true;
+        captureReason ??= "link-row-limit";
         continue;
       }
       rowBytes += bytes;
-      (unqueued ? unqueuedTargets : targets).push(link.targetUrl);
+      const reason = unqueuedReason(link.targetUrl);
+      if (reason === "robots") robotsExcludedTargets.push(link.targetUrl);
+      else if (reason === "limit") unqueuedTargets.push(link.targetUrl);
+      else targets.push(link.targetUrl);
     }
     // Never split a source's discoveries from its page completion. A retry
     // can refetch exactly those sources whose RPC never committed.
@@ -112,7 +117,10 @@ function scratchpadBatches(
       rowBytes +
         2 * sourceBytes +
         jsonStringBytes(redirectUrl ?? "") +
-        (targets.length + unqueuedTargets.length) * 8 +
+        (targets.length +
+          unqueuedTargets.length +
+          robotsExcludedTargets.length) *
+          8 +
         256 +
         discoveryBytes,
     );
@@ -121,11 +129,18 @@ function scratchpadBatches(
     batch.links.push({
       pageId,
       url,
-      targets: [...targets, ...unqueuedTargets],
+      targets: [...targets, ...unqueuedTargets, ...robotsExcludedTargets],
       incomplete,
+      captureReason,
       isHtml: page.isHtml,
       unqueuedFrom: targets.length,
-      unqueuedRedirect,
+      unqueuedRedirect: redirectReason !== null,
+      robotsExcludedFrom:
+        unqueuedTargets.length || robotsExcludedTargets.length
+          ? targets.length + unqueuedTargets.length
+          : undefined,
+      robotsExcludedRedirect:
+        redirectReason === null ? undefined : redirectReason === "robots",
     });
     batch.discovered.push(...discovered);
   }
@@ -205,10 +220,11 @@ export async function persistCrawledPages(input: {
 
   const [firstBatch, ...remainingBatches] = scratchpadBatches(
     sources,
-    (url) =>
-      !seen.has(url) &&
-      (discoveryLimited || !robots.isAllowed(url)) &&
-      eligible(url),
+    (url) => {
+      if (seen.has(url) || !eligible(url)) return null;
+      if (!robots.isAllowed(url)) return "robots";
+      return discoveryLimited ? "limit" : null;
+    },
   );
   if (discoveryLimited) firstBatch.discoveryLimited = true;
   let stats = await scratchpad.recordBatch(firstBatch);

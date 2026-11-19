@@ -6,6 +6,7 @@ import { z } from "zod";
 import type { PageFetchClass } from "@/shared/audit-fetch-class";
 import { MIN_AUDIT_PAGES, PAID_MAX_AUDIT_PAGES } from "@/shared/audit-limits";
 import { jsonCodec } from "@/shared/json";
+import type { LinkCaptureReason } from "./frontier-checkpoint";
 
 export type LighthouseStrategy = "auto" | "none";
 
@@ -177,6 +178,7 @@ export interface CrawledPageResult {
   links: PageLink[];
   /** Unread or capped HTML can hide internal targets. */
   linkCaptureIncomplete?: boolean;
+  linkCaptureReason?: LinkCaptureReason;
   hasStructuredData: boolean;
   hreflangTags: string[];
   isIndexable: boolean;

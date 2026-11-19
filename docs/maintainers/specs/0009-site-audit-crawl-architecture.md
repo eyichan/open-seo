@@ -64,6 +64,11 @@ omitted HTTP 2xx anchor can open a path one click later. The coverage manifest
 records the earliest distance at which an unknown route can begin and how
 many visited pages have a determined depth. The workflow saves the current
 segment's depths and reports analyzed HTML pages at five or more clicks.
+The manifest retains a limited sample of sources and targets at the earliest
+gap, and a separate count and sample of incomplete page captures. These
+diagnostics survive scratchpad cleanup. Page IDs identify fetched sources,
+while URL labels omit path and query text that could hold credentials. The
+HTML read limit bounds how much response content can reach the parser.
 Continuation results use the cumulative graph for these findings and do not
 modify earlier audits. Older observations can lack the HTML eligibility
 signal, even when a path can be established.

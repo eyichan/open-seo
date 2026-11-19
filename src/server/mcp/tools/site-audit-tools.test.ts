@@ -14,6 +14,7 @@ const {
   reserveAuditMock,
   claimLaunchMock,
   getWorkflowMock,
+  frontierManifestMock,
 } = vi.hoisted(() => ({
   hasPaidPlanMock: vi.fn(),
   workflowCreateMock:
@@ -31,6 +32,7 @@ const {
   reserveAuditMock: vi.fn(),
   claimLaunchMock: vi.fn(),
   getWorkflowMock: vi.fn(),
+  frontierManifestMock: vi.fn(),
 }));
 
 vi.mock("cloudflare:workers", () => ({
@@ -81,7 +83,7 @@ vi.mock("@/server/features/audit/repositories/auditResultsQueries", () => ({
 // A stored report is named by its key, so a test can tell which one was read.
 vi.mock("@/server/lib/r2", () => ({
   getJsonFromR2: async (key: string) => key,
-  getOptionalJsonFromR2: async () => null,
+  getOptionalJsonFromR2: frontierManifestMock,
 }));
 vi.mock("@/server/lib/lighthousePayload", () => ({
   readStoredLighthousePayload: (report: string) => ({
@@ -140,6 +142,7 @@ beforeEach(() => {
   projectAuditMock.mockResolvedValue(null);
   reserveAuditMock.mockResolvedValue(true);
   claimLaunchMock.mockResolvedValue(true);
+  frontierManifestMock.mockResolvedValue(null);
 });
 
 describe("site audit frontier tools", () => {
@@ -155,6 +158,66 @@ describe("site audit frontier tools", () => {
     pagesCrawled: 10,
     config: '{"maxPages":10,"lighthouseStrategy":"none"}',
   };
+
+  it("reads terminal depth diagnoses through the persisted manifest contract", async () => {
+    projectAuditMock.mockResolvedValueOnce({
+      ...parent,
+      config: '{"maxPages":10,"lighthouseStrategy":"none","coverageVersion":2}',
+    });
+    const coverage = {
+      method: "captured-navigation-v1",
+      firstIncompleteDepth: 1,
+      cohortKnownPages: 8,
+      segmentKnownPages: 8,
+      knownPagesWithUnknownHtmlEligibility: 0,
+      firstIncomplete: {
+        affectedSources: 1,
+        samples: [
+          {
+            source: parent.startUrl,
+            sourcePageId: "root",
+            target: `${parent.startUrl}?…`,
+            reason: "robots-excluded",
+          },
+        ],
+      },
+      incompleteCapture: {
+        affectedPages: 1,
+        samples: [
+          {
+            source: `${parent.startUrl}…`,
+            sourcePageId: "chart",
+            reason: "html-byte-limit",
+          },
+        ],
+      },
+    };
+    frontierManifestMock.mockResolvedValueOnce(
+      JSON.stringify({
+        version: 2,
+        auditId,
+        projectId,
+        parentAuditId: null,
+        startUrl: parent.startUrl,
+        cohortId: auditId,
+        segmentPages: parent.pagesCrawled,
+        cumulativeVisited: parent.pagesCrawled,
+        pendingCount: 0,
+        unreadPages: 0,
+        discoveryGaps: [],
+        graphComplete: false,
+        depthCoverage: coverage,
+        stop: "exhausted",
+        robotsText: null,
+        pendingParts: [],
+        visitedParts: [],
+      }),
+    );
+    const result = await getAuditFrontierTool.handler(args, ctx);
+    expect(result.structuredContent).toMatchObject({
+      coverage: { depthCoverage: coverage },
+    });
+  });
 
   it("rejects another tenant before audit lookup and rejects an audit outside the authorized project", async () => {
     projectAccessMock.mockResolvedValueOnce(null);

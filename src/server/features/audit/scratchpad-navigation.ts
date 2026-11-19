@@ -2,6 +2,11 @@ import type { AuditDepthCoverage } from "@/server/lib/audit/frontier-checkpoint"
 import { isAuditablePageUrl, isSameOrigin } from "@/server/lib/audit/url-utils";
 import { isCrawlableUrl } from "@/server/lib/audit/url-policy";
 import type { AuditConfig } from "@/server/lib/audit/types";
+import {
+  diagnosticLocation,
+  MISSING_LINK_TARGETS,
+  readDepthGap,
+} from "./scratchpad-depth-diagnostics";
 
 const BATCH_VERTICES = 128;
 const BATCH_LINK_BYTES = 4 * 1024 * 1024;
@@ -104,12 +109,7 @@ export function advanceNavigation(
         (!next.captureComplete ||
           sql
             .exec(
-              `SELECT 1 FROM page_links p
-             CROSS JOIN json_each(p.targets_json) j
-             LEFT JOIN page_mirror m ON m.url = j.value
-             LEFT JOIN frontier f ON f.url = j.value
-             WHERE p.page_id = ? AND j.type = 'text' AND m.rowid IS NULL
-               AND (f.rowid IS NOT NULL OR ? IS NULL OR j.key >= ?) LIMIT 1`,
+              `SELECT 1 ${MISSING_LINK_TARGETS} LIMIT 1`,
               next.pageId,
               next.unqueuedFrom,
               next.unqueuedFrom,
@@ -140,7 +140,10 @@ export function advanceNavigation(
   });
 }
 
-export function readNavigationCoverage(sql: SqlStorage): AuditDepthCoverage {
+export function readNavigationCoverage(
+  sql: SqlStorage,
+  startUrl?: string,
+): AuditDepthCoverage {
   const bound = nearestUnknown(sql);
   if (
     sql
@@ -157,11 +160,27 @@ export function readNavigationCoverage(sql: SqlStorage): AuditDepthCoverage {
     .toArray().length
     ? bound
     : 0;
+  let firstIncomplete: AuditDepthCoverage["firstIncomplete"];
+  if (bound !== null) firstIncomplete = readDepthGap(sql, bound);
+  else if (firstIncompleteDepth === 0) {
+    firstIncomplete = {
+      affectedSources: 0,
+      samples: [
+        {
+          source: null,
+          sourcePageId: null,
+          reason: "start-unavailable",
+          target: startUrl ? diagnosticLocation(startUrl) : null,
+        },
+      ],
+    };
+  }
   // A missing outgoing edge can only affect a path beyond the distance at
   // which the missing evidence was reached. The known prefix is still exact.
   return {
     method: "captured-navigation-v1",
     firstIncompleteDepth,
+    ...(firstIncomplete ? { firstIncomplete } : {}),
     ...sql
       .exec<{
         cohortKnownPages: number;
